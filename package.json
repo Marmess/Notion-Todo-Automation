@@ -1,0 +1,20 @@
+{
+  "name": "notion-tasks-mailer",
+  "version": "1.0.0",
+  "description": "Envoie par courriel la liste des tâches à faire d'une base Notion. Déployable sur Railway.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^6.9.14"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
