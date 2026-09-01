@@ -2,22 +2,16 @@ require('dotenv').config();
 
 const express = require('express');
 const cron = require('node-cron');
-const { Client } = require('@notionhq/client');
 
 // ---------------------------------------------------------------------------
 // Configuration (via variables d'environnement)
 // ---------------------------------------------------------------------------
 const {
   NOTION_API_KEY,
-  NOTION_DATABASE_ID,
+  // ID de la vue Notion à interroger (récupéré depuis l'URL: ?v=XXXXXXXX)
+  NOTION_VIEW_ID,
   // Nom de la propriété "titre" de la tâche dans Notion (généralement "Name" ou "Nom")
   NOTION_TITLE_PROPERTY = 'Name',
-  // Nom de la propriété qui indique si la tâche est terminée
-  NOTION_STATUS_PROPERTY = 'Status',
-  // Type de la propriété de statut: "status", "select" ou "checkbox"
-  NOTION_STATUS_PROPERTY_TYPE = 'status',
-  // Valeur(s) considérée(s) comme "terminé" pour les types status/select (séparées par des virgules)
-  NOTION_DONE_VALUES = 'Done,Terminé,Terminée',
 
   // Resend (envoi de courriel via HTTPS, contourne le blocage SMTP de Railway)
   RESEND_API_KEY,
@@ -34,8 +28,8 @@ const {
   TRIGGER_SECRET,
 } = process.env;
 
-if (!NOTION_API_KEY || !NOTION_DATABASE_ID) {
-  console.error('❌ NOTION_API_KEY et NOTION_DATABASE_ID sont requis.');
+if (!NOTION_API_KEY || !NOTION_VIEW_ID) {
+  console.error('❌ NOTION_API_KEY et NOTION_VIEW_ID sont requis.');
   process.exit(1);
 }
 if (!RESEND_API_KEY || !MAIL_TO) {
@@ -43,39 +37,29 @@ if (!RESEND_API_KEY || !MAIL_TO) {
   process.exit(1);
 }
 
-const notion = new Client({ auth: NOTION_API_KEY });
-
-const doneValues = NOTION_DONE_VALUES.split(',').map((v) => v.trim().toLowerCase());
+const NOTION_VERSION = '2026-03-11';
+const NOTION_HEADERS = {
+  Authorization: `Bearer ${NOTION_API_KEY}`,
+  'Notion-Version': NOTION_VERSION,
+  'Content-Type': 'application/json',
+};
 
 // ---------------------------------------------------------------------------
-// Extraction du texte du titre d'une page Notion
+// Extraction du texte du titre / de la date d'échéance d'une page Notion
 // ---------------------------------------------------------------------------
 function extractTitle(page) {
-  const prop = page.properties?.[NOTION_TITLE_PROPERTY];
-  if (!prop || prop.type !== 'title') return '(sans titre)';
+  const props = page.properties || {};
+  // Cherche la propriété configurée, sinon la première propriété de type "title"
+  let prop = props[NOTION_TITLE_PROPERTY];
+  if (!prop || prop.type !== 'title') {
+    prop = Object.values(props).find((p) => p.type === 'title');
+  }
+  if (!prop || !prop.title) return '(sans titre)';
   return prop.title.map((t) => t.plain_text).join('') || '(sans titre)';
 }
 
-// Détermine si une tâche est "terminée" selon le type de propriété configuré
-function isDone(page) {
-  const prop = page.properties?.[NOTION_STATUS_PROPERTY];
-  if (!prop) return false;
-
-  if (NOTION_STATUS_PROPERTY_TYPE === 'checkbox' && prop.type === 'checkbox') {
-    return prop.checkbox === true;
-  }
-  if (NOTION_STATUS_PROPERTY_TYPE === 'status' && prop.type === 'status') {
-    return doneValues.includes((prop.status?.name || '').toLowerCase());
-  }
-  if (NOTION_STATUS_PROPERTY_TYPE === 'select' && prop.type === 'select') {
-    return doneValues.includes((prop.select?.name || '').toLowerCase());
-  }
-  return false;
-}
-
 function extractDueDate(page) {
-  // Cherche une propriété de type "date" nommée "Due", "Date" ou "Échéance"
-  const candidates = ['Due', 'Date', 'Échéance', 'Deadline'];
+  const candidates = ['Due', 'Date', 'Dates', 'Échéance', 'Deadline'];
   for (const name of candidates) {
     const prop = page.properties?.[name];
     if (prop && prop.type === 'date' && prop.date?.start) {
@@ -86,41 +70,65 @@ function extractDueDate(page) {
 }
 
 // ---------------------------------------------------------------------------
-// Récupère toutes les tâches non terminées de la base Notion (avec pagination)
+// Récupère les tâches via l'API des vues Notion (reproduit le filtre/tri
+// exact configuré sur la vue choisie dans Notion, sans logique de filtre
+// dupliquée dans ce code).
 // ---------------------------------------------------------------------------
-async function fetchOpenTasks() {
-  const tasks = [];
-  let cursor = undefined;
-
-  do {
-    const response = await notion.databases.query({
-      database_id: NOTION_DATABASE_ID,
-      start_cursor: cursor,
-      page_size: 100,
-    });
-
-    for (const page of response.results) {
-      if (!isDone(page)) {
-        tasks.push({
-          title: extractTitle(page),
-          url: page.url,
-          due: extractDueDate(page),
-        });
-      }
-    }
-
-    cursor = response.has_more ? response.next_cursor : undefined;
-  } while (cursor);
-
-  // Trie par date d'échéance (les tâches sans date à la fin)
-  tasks.sort((a, b) => {
-    if (a.due && b.due) return a.due.localeCompare(b.due);
-    if (a.due) return -1;
-    if (b.due) return 1;
-    return 0;
+async function fetchViewTasks() {
+  // Étape 1: créer la requête sur la vue
+  const createRes = await fetch(`https://api.notion.com/v1/views/${NOTION_VIEW_ID}/queries`, {
+    method: 'POST',
+    headers: NOTION_HEADERS,
+    body: JSON.stringify({ page_size: 100 }),
   });
+  if (!createRes.ok) {
+    const errText = await createRes.text();
+    throw new Error(`Notion (create query) a répondu ${createRes.status}: ${errText}`);
+  }
+  const queryData = await createRes.json();
 
-  return tasks;
+  const queryId = queryData.id;
+  let allPages = [...(queryData.results || [])];
+  let cursor = queryData.next_cursor;
+  let hasMore = queryData.has_more;
+
+  // Étape 2: paginer si nécessaire
+  while (hasMore && cursor) {
+    const pageRes = await fetch(
+      `https://api.notion.com/v1/views/${NOTION_VIEW_ID}/queries/${queryId}?start_cursor=${cursor}&page_size=100`,
+      { headers: NOTION_HEADERS }
+    );
+    if (!pageRes.ok) break;
+    const pageData = await pageRes.json();
+    allPages = allPages.concat(pageData.results || []);
+    cursor = pageData.next_cursor;
+    hasMore = pageData.has_more;
+  }
+
+  // Étape 3: nettoyer la requête côté Notion (bonne pratique)
+  fetch(`https://api.notion.com/v1/views/${NOTION_VIEW_ID}/queries/${queryId}`, {
+    method: 'DELETE',
+    headers: NOTION_HEADERS,
+  }).catch(() => {});
+
+  // Étape 4: si les résultats n'incluent pas déjà les propriétés complètes,
+  // aller chercher chaque page individuellement.
+  const fullPages = await Promise.all(
+    allPages.map(async (stub) => {
+      if (stub.properties) return stub;
+      const res = await fetch(`https://api.notion.com/v1/pages/${stub.id}`, {
+        headers: NOTION_HEADERS,
+      });
+      if (!res.ok) return stub;
+      return res.json();
+    })
+  );
+
+  return fullPages.map((page) => ({
+    title: extractTitle(page),
+    url: page.url,
+    due: extractDueDate(page),
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +177,7 @@ function buildEmailContent(tasks) {
 }
 
 async function sendTasksEmail() {
-  const tasks = await fetchOpenTasks();
+  const tasks = await fetchViewTasks();
   const { subject, text, html } = buildEmailContent(tasks);
 
   const response = await fetch('https://api.resend.com/emails', {
