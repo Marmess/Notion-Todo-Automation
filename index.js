@@ -140,6 +140,7 @@ function buildEmailContent(tasks) {
     year: 'numeric',
     month: 'long',
     day: 'numeric',
+    timeZone: CRON_TIMEZONE,
   });
 
   if (tasks.length === 0) {
