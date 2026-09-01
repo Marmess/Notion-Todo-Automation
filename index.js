@@ -2,7 +2,6 @@ require('dotenv').config();
 
 const express = require('express');
 const cron = require('node-cron');
-const nodemailer = require('nodemailer');
 const { Client } = require('@notionhq/client');
 
 // ---------------------------------------------------------------------------
@@ -20,12 +19,8 @@ const {
   // Valeur(s) considérée(s) comme "terminé" pour les types status/select (séparées par des virgules)
   NOTION_DONE_VALUES = 'Done,Terminé,Terminée',
 
-  // SMTP (fonctionne avec Gmail via un "mot de passe d'application")
-  SMTP_HOST,
-  SMTP_PORT = '587',
-  SMTP_SECURE = 'false',
-  SMTP_USER,
-  SMTP_PASS,
+  // Resend (envoi de courriel via HTTPS, contourne le blocage SMTP de Railway)
+  RESEND_API_KEY,
   MAIL_FROM,
   MAIL_TO,
 
@@ -43,19 +38,12 @@ if (!NOTION_API_KEY || !NOTION_DATABASE_ID) {
   console.error('❌ NOTION_API_KEY et NOTION_DATABASE_ID sont requis.');
   process.exit(1);
 }
-if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS || !MAIL_TO) {
-  console.error('❌ SMTP_HOST, SMTP_USER, SMTP_PASS et MAIL_TO sont requis.');
+if (!RESEND_API_KEY || !MAIL_TO) {
+  console.error('❌ RESEND_API_KEY et MAIL_TO sont requis.');
   process.exit(1);
 }
 
 const notion = new Client({ auth: NOTION_API_KEY });
-
-const transporter = nodemailer.createTransport({
-  host: SMTP_HOST,
-  port: Number(SMTP_PORT),
-  secure: SMTP_SECURE === 'true', // true pour le port 465, false pour 587
-  auth: { user: SMTP_USER, pass: SMTP_PASS },
-});
 
 const doneValues = NOTION_DONE_VALUES.split(',').map((v) => v.trim().toLowerCase());
 
@@ -184,13 +172,25 @@ async function sendTasksEmail() {
   const tasks = await fetchOpenTasks();
   const { subject, text, html } = buildEmailContent(tasks);
 
-  await transporter.sendMail({
-    from: MAIL_FROM || SMTP_USER,
-    to: MAIL_TO,
-    subject,
-    text,
-    html,
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM || 'onboarding@resend.dev',
+      to: [MAIL_TO],
+      subject,
+      text,
+      html,
+    }),
   });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Resend a répondu ${response.status}: ${errorBody}`);
+  }
 
   console.log(`✅ Courriel envoyé (${tasks.length} tâche(s)) à ${MAIL_TO}`);
   return tasks.length;
