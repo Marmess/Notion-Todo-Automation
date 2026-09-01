@@ -150,18 +150,10 @@ function buildEmailContent(tasks) {
     };
   }
 
-  const textLines = tasks.map((t, i) => {
-    const due = t.due ? ` (échéance: ${t.due})` : '';
-    return `${i + 1}. ${t.title}${due}`;
-  });
+  const textLines = tasks.map((t, i) => `${i + 1}. ${t.title}`);
 
   const htmlItems = tasks
-    .map((t) => {
-      const due = t.due
-        ? ` <span style="color:#888;font-size:12px;">(échéance: ${t.due})</span>`
-        : '';
-      return `<li><a href="${t.url}" style="text-decoration:none;color:#111;">${t.title}</a>${due}</li>`;
-    })
+    .map((t) => `<li><a href="${t.url}" style="text-decoration:none;color:#111;">${t.title}</a></li>`)
     .join('\n');
 
   return {
