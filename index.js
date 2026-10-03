@@ -12,6 +12,10 @@ const {
   NOTION_VIEW_ID,
   // Nom de la propriété "titre" de la tâche dans Notion (généralement "Name" ou "Nom")
   NOTION_TITLE_PROPERTY = 'Name',
+  // Nom de la propriété "Priorité" (type Select) dans Notion
+  NOTION_PRIORITY_PROPERTY = 'Priorité',
+  // Valeur exacte qui indique qu'une tâche est prioritaire
+  NOTION_PRIORITY_VALUE = 'Prioritaire',
 
   // Resend (envoi de courriel via HTTPS, contourne le blocage SMTP de Railway)
   RESEND_API_KEY,
@@ -56,6 +60,12 @@ function extractTitle(page) {
   }
   if (!prop || !prop.title) return '(sans titre)';
   return prop.title.map((t) => t.plain_text).join('') || '(sans titre)';
+}
+
+function extractPriority(page) {
+  const prop = page.properties?.[NOTION_PRIORITY_PROPERTY];
+  if (!prop || prop.type !== 'select') return false;
+  return prop.select?.name === NOTION_PRIORITY_VALUE;
 }
 
 function extractDueDate(page) {
@@ -128,6 +138,7 @@ async function fetchViewTasks() {
     title: extractTitle(page),
     url: page.url,
     due: extractDueDate(page),
+    isPriority: extractPriority(page),
   }));
 }
 
@@ -151,19 +162,41 @@ function buildEmailContent(tasks) {
     };
   }
 
-  const textLines = tasks.map((t, i) => `${i + 1}. ${t.title}`);
+  const priorityTasks = tasks.filter((t) => t.isPriority);
+  const regularTasks = tasks.filter((t) => !t.isPriority);
 
-  const htmlItems = tasks
-    .map((t) => `<li><a href="${t.url}" style="text-decoration:none;color:#111;">${t.title}</a></li>`)
-    .join('\n');
+  const textSection = (label, list) => {
+    if (list.length === 0) return '';
+    const lines = list.map((t, i) => `${i + 1}. ${t.title}`);
+    return `${label}\n${lines.join('\n')}`;
+  };
+  const textParts = [
+    textSection('Prioritaire', priorityTasks),
+    textSection('Non prioritaire', regularTasks),
+  ].filter(Boolean);
+
+  const htmlSection = (label, list) => {
+    if (list.length === 0) return '';
+    const items = list
+      .map((t) => `<li><a href="${t.url}" style="text-decoration:none;color:#111;">${t.title}</a></li>`)
+      .join('\n');
+    return `
+      <h3 style="margin-bottom:4px;">${label}</h3>
+      <ul style="line-height:1.8;margin-top:0;">${items}</ul>
+    `;
+  };
+  const htmlParts = [
+    htmlSection('Prioritaire', priorityTasks),
+    htmlSection('Non prioritaire', regularTasks),
+  ].filter(Boolean);
 
   return {
     subject: `📋 ${tasks.length} tâche(s) à faire — ${dateStr}`,
-    text: `Tâches à faire (${dateStr}):\n\n${textLines.join('\n')}`,
+    text: `Tâches à faire (${dateStr}):\n\n${textParts.join('\n\n')}`,
     html: `
       <div style="font-family:sans-serif;max-width:600px;margin:0 auto;">
         <h2>📋 Tâches à faire — ${dateStr}</h2>
-        <ul style="line-height:1.8;">${htmlItems}</ul>
+        ${htmlParts.join('\n')}
       </div>
     `,
   };
