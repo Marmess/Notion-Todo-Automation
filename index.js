@@ -17,8 +17,13 @@ const {
   NOTION_PRIORITY_PROPERTY = 'Priorité',
   // Valeur exacte qui indique qu'une tâche est prioritaire
   NOTION_PRIORITY_VALUE = 'Prioritaire',
-  // Nom exact de la colonne date d'échéance dans Notion
+  // Nom exact de la colonne date d'échéance dans Notion (pour le compte
+  // à rebours affiché dans le courriel quotidien)
   NOTION_DUE_DATE_PROPERTY = 'Due Date',
+  // Nom exact de la colonne "jour prévu pour faire la tâche" (utilisée par
+  // ton filtre de vue). C'est celle-ci qu'on remplit avec la date du jour
+  // quand une tâche est créée depuis un courriel.
+  NOTION_TASK_DATE_PROPERTY = 'Dates',
 
   // Resend (envoi de courriel via HTTPS, contourne le blocage SMTP de Railway)
   RESEND_API_KEY,
@@ -108,7 +113,7 @@ async function createNotionTaskFromEmail(subject) {
         [NOTION_TITLE_PROPERTY]: {
           title: [{ text: { content: title } }],
         },
-        [NOTION_DUE_DATE_PROPERTY]: {
+        [NOTION_TASK_DATE_PROPERTY]: {
           date: { start: todayStr },
         },
       },
