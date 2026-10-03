@@ -16,6 +16,8 @@ const {
   NOTION_PRIORITY_PROPERTY = 'Priorité',
   // Valeur exacte qui indique qu'une tâche est prioritaire
   NOTION_PRIORITY_VALUE = 'Prioritaire',
+  // Nom exact de la colonne date d'échéance dans Notion
+  NOTION_DUE_DATE_PROPERTY = 'Due Date',
 
   // Resend (envoi de courriel via HTTPS, contourne le blocage SMTP de Railway)
   RESEND_API_KEY,
@@ -70,7 +72,7 @@ function extractPriorityStatus(page) {
 }
 
 function extractDueDate(page) {
-  const candidates = ['Due', 'Date', 'Dates', 'Échéance', 'Deadline'];
+  const candidates = [NOTION_DUE_DATE_PROPERTY, 'Due', 'Due Date', 'Date', 'Dates', 'Échéance', 'Deadline'];
   for (const name of candidates) {
     const prop = page.properties?.[name];
     if (prop && prop.type === 'date' && prop.date?.start) {
@@ -78,6 +80,72 @@ function extractDueDate(page) {
     }
   }
   return null;
+}
+
+// Extrait l'année/mois/jour d'une date ISO Notion, selon le fuseau configuré
+// si une heure est présente (pour éviter le décalage UTC).
+function extractCalendarDate(isoDate) {
+  const dateOnlyMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
+  if (dateOnlyMatch) {
+    const [, year, month, day] = dateOnlyMatch;
+    return { year: Number(year), month: Number(month), day: Number(day) };
+  }
+  const d = new Date(isoDate);
+  if (isNaN(d.getTime())) return null;
+  // 'en-CA' donne le format YYYY-MM-DD, pratique à re-découper
+  const parts = d.toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE }).split('-');
+  return { year: Number(parts[0]), month: Number(parts[1]), day: Number(parts[2]) };
+}
+
+// Calcule le nombre de jours de calendrier entre aujourd'hui (selon le
+// fuseau configuré) et la date d'échéance. Positif = futur, négatif = passé.
+function daysUntilDue(isoDate) {
+  const due = extractCalendarDate(isoDate);
+  if (!due) return null;
+
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE });
+  const [ty, tm, td] = todayStr.split('-').map(Number);
+
+  const dueUTC = Date.UTC(due.year, due.month - 1, due.day);
+  const todayUTC = Date.UTC(ty, tm - 1, td);
+
+  return Math.round((dueUTC - todayUTC) / 86400000);
+}
+
+// Formate le nombre de jours en texte lisible: 'aujourd'hui', 'demain',
+// 'dans 3 jours', 'en retard de 2 jours', etc.
+function formatDaysUntil(isoDate) {
+  const diff = daysUntilDue(isoDate);
+  if (diff === null) return '';
+  if (diff === 0) return "aujourd'hui";
+  if (diff === 1) return 'demain';
+  if (diff === -1) return 'en retard de 1 jour';
+  if (diff > 1) return `dans ${diff} jours`;
+  return `en retard de ${Math.abs(diff)} jours`;
+}
+
+// Formate une date ISO Notion ('2026-10-15' ou '2026-10-15T14:30:00...')
+// en court format lisible, ex: '15 oct.'
+function formatDueDate(isoDate) {
+  if (!isoDate) return '';
+
+  // Date seule (pas d'heure, ex: '2026-10-15'): on parse les chiffres
+  // directement pour éviter que le fuseau horaire décale le jour.
+  const dateOnlyMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
+  if (dateOnlyMatch) {
+    const [, year, month, day] = dateOnlyMatch;
+    const d = new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)));
+    return d.toLocaleDateString('fr-CA', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+  }
+
+  // Date avec heure: on convertit normalement selon le fuseau configuré.
+  const d = new Date(isoDate);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('fr-CA', {
+    day: 'numeric',
+    month: 'short',
+    timeZone: CRON_TIMEZONE,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +237,12 @@ function buildEmailContent(tasks) {
 
   const textSection = (label, list) => {
     if (list.length === 0) return '';
-    const lines = list.map((t, i) => `${i + 1}. ${t.title}`);
+    const lines = list.map((t, i) => {
+      const due = formatDueDate(t.due);
+      const daysLabel = formatDaysUntil(t.due);
+      const suffix = due ? ` (${due}${daysLabel ? ` — ${daysLabel}` : ''})` : '';
+      return `${i + 1}. ${t.title}${suffix}`;
+    });
     return `${label}\n${lines.join('\n')}`;
   };
   const textParts = [
@@ -181,7 +254,14 @@ function buildEmailContent(tasks) {
   const htmlSection = (label, list) => {
     if (list.length === 0) return '';
     const items = list
-      .map((t) => `<li><a href="${t.url}" style="text-decoration:none;color:#111;">${t.title}</a></li>`)
+      .map((t) => {
+        const due = formatDueDate(t.due);
+        const daysLabel = formatDaysUntil(t.due);
+        const dueHtml = due
+          ? ` <span style="color:#888;font-size:12px;">(${due}${daysLabel ? ` — ${daysLabel}` : ''})</span>`
+          : '';
+        return `<li><a href="${t.url}" style="text-decoration:none;color:#111;">${t.title}</a>${dueHtml}</li>`;
+      })
       .join('\n');
     return `
       <h3 style="margin-bottom:4px;">${label}</h3>
