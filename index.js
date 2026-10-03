@@ -62,10 +62,11 @@ function extractTitle(page) {
   return prop.title.map((t) => t.plain_text).join('') || '(sans titre)';
 }
 
-function extractPriority(page) {
+// Retourne 'priority', 'regular' ou 'unclassified' selon la valeur de la colonne Priorité
+function extractPriorityStatus(page) {
   const prop = page.properties?.[NOTION_PRIORITY_PROPERTY];
-  if (!prop || prop.type !== 'select') return false;
-  return prop.select?.name === NOTION_PRIORITY_VALUE;
+  if (!prop || prop.type !== 'select' || !prop.select) return 'unclassified';
+  return prop.select.name === NOTION_PRIORITY_VALUE ? 'priority' : 'regular';
 }
 
 function extractDueDate(page) {
@@ -138,7 +139,7 @@ async function fetchViewTasks() {
     title: extractTitle(page),
     url: page.url,
     due: extractDueDate(page),
-    isPriority: extractPriority(page),
+    priorityStatus: extractPriorityStatus(page),
   }));
 }
 
@@ -162,8 +163,9 @@ function buildEmailContent(tasks) {
     };
   }
 
-  const priorityTasks = tasks.filter((t) => t.isPriority);
-  const regularTasks = tasks.filter((t) => !t.isPriority);
+  const unclassifiedTasks = tasks.filter((t) => t.priorityStatus === 'unclassified');
+  const priorityTasks = tasks.filter((t) => t.priorityStatus === 'priority');
+  const regularTasks = tasks.filter((t) => t.priorityStatus === 'regular');
 
   const textSection = (label, list) => {
     if (list.length === 0) return '';
@@ -171,6 +173,7 @@ function buildEmailContent(tasks) {
     return `${label}\n${lines.join('\n')}`;
   };
   const textParts = [
+    textSection('Non classé', unclassifiedTasks),
     textSection('Prioritaire', priorityTasks),
     textSection('Non prioritaire', regularTasks),
   ].filter(Boolean);
@@ -186,6 +189,7 @@ function buildEmailContent(tasks) {
     `;
   };
   const htmlParts = [
+    htmlSection('Non classé', unclassifiedTasks),
     htmlSection('Prioritaire', priorityTasks),
     htmlSection('Non prioritaire', regularTasks),
   ].filter(Boolean);
