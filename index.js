@@ -225,9 +225,9 @@ function buildEmailContent(tasks) {
 
   if (tasks.length === 0) {
     return {
-      subject: `✅ Aucune tâche en attente — ${dateStr}`,
-      text: 'Aucune tâche à faire pour le moment. 🎉',
-      html: '<p>Aucune tâche à faire pour le moment. 🎉</p>',
+      subject: `Aucune tâche en attente — ${dateStr}`,
+      text: 'Aucune tâche à faire pour le moment.',
+      html: '<p>Aucune tâche à faire pour le moment.</p>',
     };
   }
 
@@ -238,10 +238,8 @@ function buildEmailContent(tasks) {
   const textSection = (label, list) => {
     if (list.length === 0) return '';
     const lines = list.map((t, i) => {
-      const due = formatDueDate(t.due);
-      const daysLabel = formatDaysUntil(t.due);
-      const suffix = due ? ` (${due}${daysLabel ? ` — ${daysLabel}` : ''})` : '';
-      return `${i + 1}. ${t.title}${suffix}`;
+      const daysLabel = formatDaysUntil(t.due) || formatDueDate(t.due);
+      return `${i + 1}. ${t.title}${daysLabel ? ` (${daysLabel})` : ''}`;
     });
     return `${label}\n${lines.join('\n')}`;
   };
@@ -255,10 +253,9 @@ function buildEmailContent(tasks) {
     if (list.length === 0) return '';
     const items = list
       .map((t) => {
-        const due = formatDueDate(t.due);
-        const daysLabel = formatDaysUntil(t.due);
-        const dueHtml = due
-          ? ` <span style="color:#888;font-size:12px;">(${due}${daysLabel ? ` — ${daysLabel}` : ''})</span>`
+        const daysLabel = formatDaysUntil(t.due) || formatDueDate(t.due);
+        const dueHtml = daysLabel
+          ? ` <span style="color:#888;font-size:12px;">(${daysLabel})</span>`
           : '';
         return `<li><a href="${t.url}" style="text-decoration:none;color:#111;">${t.title}</a>${dueHtml}</li>`;
       })
@@ -275,11 +272,11 @@ function buildEmailContent(tasks) {
   ].filter(Boolean);
 
   return {
-    subject: `📋 ${tasks.length} tâche(s) à faire — ${dateStr}`,
-    text: `Tâches à faire (${dateStr}):\n\n${textParts.join('\n\n')}`,
+    subject: `${tasks.length} tâche(s) à faire — ${dateStr}`,
+    text: `Tâches à faire:\n\n${textParts.join('\n\n')}`,
     html: `
       <div style="font-family:sans-serif;max-width:600px;margin:0 auto;">
-        <h2>📋 Tâches à faire — ${dateStr}</h2>
+        <h2>TÂCHES À FAIRE</h2>
         ${htmlParts.join('\n')}
       </div>
     `,
