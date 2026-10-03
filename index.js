@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+const crypto = require('crypto');
 const express = require('express');
 const cron = require('node-cron');
 
@@ -23,6 +24,14 @@ const {
   RESEND_API_KEY,
   MAIL_FROM,
   MAIL_TO,
+
+  // ID de la base de données Notion (requis pour CRÉER des pages/tâches;
+  // la vue ne sert qu'à LIRE). Récupéré depuis l'URL de la base.
+  NOTION_DATABASE_ID,
+  // Secret du webhook Resend (fourni lors de la création du webhook,
+  // commence par 'whsec_'), pour vérifier que les requêtes entrantes
+  // proviennent bien de Resend.
+  RESEND_WEBHOOK_SECRET,
 
   // Planification du cron (par défaut: tous les jours à 8h00)
   CRON_SCHEDULE = '0 8 * * *',
@@ -49,6 +58,66 @@ const NOTION_HEADERS = {
   'Notion-Version': NOTION_VERSION,
   'Content-Type': 'application/json',
 };
+
+// ---------------------------------------------------------------------------
+// Vérification de la signature des webhooks Resend (format Svix)
+// ---------------------------------------------------------------------------
+function verifyResendWebhook(rawBody, headers) {
+  if (!RESEND_WEBHOOK_SECRET) return false;
+
+  const svixId = headers['svix-id'];
+  const svixTimestamp = headers['svix-timestamp'];
+  const svixSignature = headers['svix-signature'];
+  if (!svixId || !svixTimestamp || !svixSignature) return false;
+
+  const secretBytes = Buffer.from(RESEND_WEBHOOK_SECRET.split('_')[1], 'base64');
+  const signedContent = `${svixId}.${svixTimestamp}.${rawBody}`;
+  const expectedSignature = crypto
+    .createHmac('sha256', secretBytes)
+    .update(signedContent)
+    .digest('base64');
+
+  return svixSignature
+    .split(' ')
+    .map((part) => part.split(',')[1])
+    .some((sig) => {
+      try {
+        return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSignature));
+      } catch {
+        return false;
+      }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Crée une nouvelle page (tâche) dans la base Notion à partir d'un sujet
+// de courriel.
+// ---------------------------------------------------------------------------
+async function createNotionTaskFromEmail(subject) {
+  const title = (subject || '(sans sujet)').trim();
+
+  const res = await fetch('https://api.notion.com/v1/pages', {
+    method: 'POST',
+    headers: NOTION_HEADERS,
+    body: JSON.stringify({
+      parent: { database_id: NOTION_DATABASE_ID },
+      properties: {
+        [NOTION_TITLE_PROPERTY]: {
+          title: [{ text: { content: title } }],
+        },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Notion (create page) a répondu ${res.status}: ${errText}`);
+  }
+
+  const page = await res.json();
+  console.log(`✅ Tâche créée dans Notion: "${title}" (${page.id})`);
+  return page;
+}
 
 // ---------------------------------------------------------------------------
 // Extraction du texte du titre / de la date d'échéance d'une page Notion
@@ -321,6 +390,38 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ status: 'healthy' }));
+
+// Endpoint appelé par Resend à chaque courriel reçu sur l'adresse dédiée
+// (ex: todomartin@notion.14lieux.com). Utilise express.raw() pour garder
+// le corps brut, nécessaire à la vérification de signature.
+app.post('/inbound-email', express.raw({ type: 'application/json' }), async (req, res) => {
+  const rawBody = req.body.toString('utf8');
+
+  if (!verifyResendWebhook(rawBody, req.headers)) {
+    console.error('❌ Signature webhook invalide, requête ignorée.');
+    return res.status(401).json({ error: 'Signature invalide' });
+  }
+
+  let event;
+  try {
+    event = JSON.parse(rawBody);
+  } catch {
+    return res.status(400).json({ error: 'JSON invalide' });
+  }
+
+  // On répond tout de suite à Resend pour éviter un timeout/retry,
+  // et on traite la création de la tâche ensuite.
+  res.status(200).json({ received: true });
+
+  if (event.type !== 'email.received') return;
+
+  try {
+    const subject = event.data?.subject;
+    await createNotionTaskFromEmail(subject);
+  } catch (err) {
+    console.error('Erreur lors de la création de la tâche depuis le courriel:', err);
+  }
+});
 
 // Endpoint pour déclencher l'envoi manuellement
 app.post('/send-tasks', async (req, res) => {
