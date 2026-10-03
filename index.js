@@ -111,11 +111,48 @@ function extractSenderEmail(fromField) {
   return '';
 }
 
+// Récupère le contenu complet d'un courriel reçu (le webhook ne transmet
+// que les métadonnées — sujet/expéditeur — pas le corps).
+async function fetchInboundEmailContent(emailId) {
+  if (!emailId) return '';
+
+  const res = await fetch(`https://api.resend.com/emails/receiving/${emailId}`, {
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}` },
+  });
+  if (!res.ok) {
+    console.error(`⚠️ Impossible de récupérer le contenu du courriel (${res.status}).`);
+    return '';
+  }
+
+  const email = await res.json();
+  if (email.text) return email.text.trim();
+  if (email.html) {
+    // Retrait grossier des balises HTML si seul le HTML est disponible
+    return email.html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  return '';
+}
+
+// Découpe un texte en blocs "paragraph" Notion (max ~1900 caractères
+// chacun, limite imposée par l'API Notion sur le texte riche).
+function textToNotionBlocks(text) {
+  if (!text) return [];
+  const chunks = [];
+  for (let i = 0; i < text.length; i += 1900) {
+    chunks.push(text.slice(i, i + 1900));
+  }
+  return chunks.map((chunk) => ({
+    object: 'block',
+    type: 'paragraph',
+    paragraph: { rich_text: [{ type: 'text', text: { content: chunk } }] },
+  }));
+}
+
 // ---------------------------------------------------------------------------
 // Crée une nouvelle page (tâche) dans la base Notion à partir d'un sujet
 // de courriel.
 // ---------------------------------------------------------------------------
-async function createNotionTaskFromEmail(subject) {
+async function createNotionTaskFromEmail(subject, bodyContent) {
   const title = (subject || '(sans sujet)').trim();
 
   // Date d'aujourd'hui (selon le fuseau configuré), au format YYYY-MM-DD
@@ -134,6 +171,7 @@ async function createNotionTaskFromEmail(subject) {
           date: { start: todayStr },
         },
       },
+      children: textToNotionBlocks(bodyContent),
     }),
   });
 
@@ -483,7 +521,8 @@ app.post('/inbound-email', express.raw({ type: 'application/json' }), async (req
 
   try {
     const subject = event.data?.subject;
-    const page = await createNotionTaskFromEmail(subject);
+    const bodyContent = await fetchInboundEmailContent(event.data?.email_id);
+    const page = await createNotionTaskFromEmail(subject, bodyContent);
     await sendTaskCreatedReminder((subject || '(sans sujet)').trim(), page.url);
     console.log('✅ Courriel de rappel envoyé.');
   } catch (err) {
