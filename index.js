@@ -96,6 +96,9 @@ function verifyResendWebhook(rawBody, headers) {
 async function createNotionTaskFromEmail(subject) {
   const title = (subject || '(sans sujet)').trim();
 
+  // Date d'aujourd'hui (selon le fuseau configuré), au format YYYY-MM-DD
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE });
+
   const res = await fetch('https://api.notion.com/v1/pages', {
     method: 'POST',
     headers: NOTION_HEADERS,
@@ -104,6 +107,9 @@ async function createNotionTaskFromEmail(subject) {
       properties: {
         [NOTION_TITLE_PROPERTY]: {
           title: [{ text: { content: title } }],
+        },
+        [NOTION_DUE_DATE_PROPERTY]: {
+          date: { start: todayStr },
         },
       },
     }),
