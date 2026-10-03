@@ -130,6 +130,36 @@ async function createNotionTaskFromEmail(subject) {
   return page;
 }
 
+// Envoie un petit courriel de rappel demandant de compléter la nouvelle
+// tâche (échéance + priorité), avec un lien direct vers la page Notion.
+async function sendTaskCreatedReminder(title, pageUrl) {
+  const response = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: MAIL_FROM || 'onboarding@resend.dev',
+      to: [MAIL_TO],
+      subject: `🆕 Nouvelle tâche: ${title}`,
+      text: `"${title}" a été ajoutée à Notion.\n\nN'oublie pas d'ajouter l'échéance (Due Date) et la priorité.\n\n${pageUrl}`,
+      html: `
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto;">
+          <p><strong>"${title}"</strong> a été ajoutée à Notion.</p>
+          <p>N'oublie pas d'ajouter l'échéance (<em>Due Date</em>) et la priorité.</p>
+          <p><a href="${pageUrl}" style="color:#111;">Ouvrir la tâche dans Notion →</a></p>
+        </div>
+      `,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Resend (reminder) a répondu ${response.status}: ${errorBody}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Extraction du texte du titre / de la date d'échéance d'une page Notion
 // ---------------------------------------------------------------------------
@@ -428,7 +458,9 @@ app.post('/inbound-email', express.raw({ type: 'application/json' }), async (req
 
   try {
     const subject = event.data?.subject;
-    await createNotionTaskFromEmail(subject);
+    const page = await createNotionTaskFromEmail(subject);
+    await sendTaskCreatedReminder((subject || '(sans sujet)').trim(), page.url);
+    console.log('✅ Courriel de rappel envoyé.');
   } catch (err) {
     console.error('Erreur lors de la création de la tâche depuis le courriel:', err);
   }
