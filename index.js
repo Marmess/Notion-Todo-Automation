@@ -37,6 +37,9 @@ const {
   // commence par 'whsec_'), pour vérifier que les requêtes entrantes
   // proviennent bien de Resend.
   RESEND_WEBHOOK_SECRET,
+  // Seule cette adresse peut créer des tâches par courriel entrant
+  // (par défaut: ta propre adresse, MAIL_TO). Les autres sont ignorés.
+  ALLOWED_SENDER_EMAIL = MAIL_TO,
 
   // Planification du cron (par défaut: tous les jours à 8h00)
   CRON_SCHEDULE = '0 8 * * *',
@@ -92,6 +95,20 @@ function verifyResendWebhook(rawBody, headers) {
         return false;
       }
     });
+}
+
+// Extrait juste l'adresse courriel d'un champ "from", qu'il soit une simple
+// chaîne ('a@b.com' ou 'Nom <a@b.com>') ou un objet { email, name }.
+function extractSenderEmail(fromField) {
+  if (!fromField) return '';
+  if (typeof fromField === 'object' && fromField.email) {
+    return fromField.email.trim().toLowerCase();
+  }
+  if (typeof fromField === 'string') {
+    const match = /<(.+)>/.exec(fromField);
+    return (match ? match[1] : fromField).trim().toLowerCase();
+  }
+  return '';
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +474,12 @@ app.post('/inbound-email', express.raw({ type: 'application/json' }), async (req
   res.status(200).json({ received: true });
 
   if (event.type !== 'email.received') return;
+
+  const senderEmail = extractSenderEmail(event.data?.from);
+  if (senderEmail !== (ALLOWED_SENDER_EMAIL || '').trim().toLowerCase()) {
+    console.log(`⚠️ Courriel ignoré, expéditeur non autorisé: ${senderEmail || '(inconnu)'}`);
+    return;
+  }
 
   try {
     const subject = event.data?.subject;
