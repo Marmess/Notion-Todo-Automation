@@ -142,13 +142,14 @@ async function sendTaskCreatedReminder(title, pageUrl) {
     body: JSON.stringify({
       from: MAIL_FROM || 'onboarding@resend.dev',
       to: [MAIL_TO],
-      subject: `🔴 Nouvelle tâche: ${title}`,
-      text: `"${title}" a été ajoutée à Notion.\n\nN'oublie pas d'ajouter l'échéance (Due Date) et la priorité.\n\n${pageUrl}`,
+      subject: `→ ${title}`,
+      text: `${title.toUpperCase()}\nDue Date (à ajouter)\nPriorité (à ajouter)\n\n${pageUrl}`,
       html: `
-        <div style="font-family:sans-serif;max-width:600px;margin:0 auto;">
-          <a href="${pageUrl}" style="text-decoration:none;color:#111;display:block;">
-            <p><strong>"${title}"</strong> a été ajoutée à Notion.</p>
-            <p>N'oublie pas d'ajouter l'échéance (<em>Due Date</em>) et la priorité.</p>
+        <div style="font-family:sans-serif;max-width:600px;margin:0 auto;font-size:18px;">
+          <a href="${pageUrl}" style="text-decoration:underline;color:#111;display:block;">
+            <p style="font-weight:bold;margin-bottom:4px;">${title.toUpperCase()}</p>
+            <p style="margin:0;">Due Date (à ajouter)</p>
+            <p style="margin:0;">Priorité (à ajouter)</p>
           </a>
         </div>
       `,
