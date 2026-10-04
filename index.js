@@ -178,14 +178,79 @@ function parseSettingsPage(page) {
   return { timezone, sendTime, active, source: 'Notion', warnings };
 }
 
-async function loadSettingsFromNotion() {
+// Titre de la base Réglages, utilisé pour la retrouver si l'identifiant
+// fourni n'est pas celui de la base (par exemple l'identifiant de la page qui
+// la contient, quand le lien copié vient d'une vue).
+const SETTINGS_DATABASE_TITLE = 'Réglages';
+let resolvedSettingsDatabaseId = null;
+
+const sameId = (a, b) => String(a).replace(/-/g, '').toLowerCase() === String(b).replace(/-/g, '').toLowerCase();
+
+async function findSettingsDatabaseId() {
+  const res = await fetch('https://api.notion.com/v1/search', {
+    method: 'POST',
+    headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
+    body: JSON.stringify({
+      query: SETTINGS_DATABASE_TITLE,
+      filter: { property: 'object', value: 'database' },
+      page_size: 25,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`La recherche de la base "${SETTINGS_DATABASE_TITLE}" a échoué (${res.status}).`);
+  }
+  const data = await res.json();
+  const wanted = normalizeName(SETTINGS_DATABASE_TITLE);
+  const matches = (data.results || []).filter(
+    (db) => normalizeName((db.title || []).map((t) => t.plain_text).join('')) === wanted
+  );
+  if (matches.length === 0) {
+    throw new Error(
+      `Aucune base nommée "${SETTINGS_DATABASE_TITLE}" n'est accessible à l'intégration (vérifie Settings > Connections > Manage page access).`
+    );
+  }
+  if (matches.length > 1) {
+    console.warn(`⚠️ ${matches.length} bases nommées "${SETTINGS_DATABASE_TITLE}" trouvées, la première est utilisée.`);
+  }
+  return matches[0].id;
+}
+
+function querySettingsDatabase(databaseId) {
   // L'ancienne version d'API (2022-06-28) est la plus simple pour lire la
   // première ligne d'une base ordinaire.
-  const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_SETTINGS_DATABASE_ID}/query`, {
+  return fetch(`https://api.notion.com/v1/databases/${databaseId}/query`, {
     method: 'POST',
     headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
     body: JSON.stringify({ page_size: 1 }),
   });
+}
+
+async function loadSettingsFromNotion() {
+  const id = resolvedSettingsDatabaseId || NOTION_SETTINGS_DATABASE_ID;
+  let res = await querySettingsDatabase(id);
+
+  // 404: l'identifiant n'est pas celui d'une base accessible. On cherche la
+  // base par son titre plutôt que de laisser les réglages inutilisables.
+  if (res.status === 404) {
+    let foundId = null;
+    let searchProblem = '';
+    try {
+      foundId = await findSettingsDatabaseId();
+    } catch (err) {
+      searchProblem = err.message;
+    }
+    if (!foundId) {
+      throw new Error(`Base introuvable avec l'identifiant fourni (404). ${searchProblem}`);
+    }
+    if (!sameId(foundId, id)) {
+      resolvedSettingsDatabaseId = foundId;
+      console.log(
+        `ℹ️ Base "${SETTINGS_DATABASE_TITLE}" trouvée par son titre (id: ${foundId}). Tu peux mettre cet identifiant dans NOTION_SETTINGS_DATABASE_ID.`
+      );
+      res = await querySettingsDatabase(foundId);
+    }
+  }
+
   if (!res.ok) {
     throw new Error(`Notion (réglages) a répondu ${res.status}: ${await res.text()}`);
   }
