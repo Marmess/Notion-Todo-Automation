@@ -47,6 +47,9 @@ const {
   // actif). Optionnel: sans cette variable, les valeurs ci-dessous sont
   // utilisées telles quelles.
   NOTION_SETTINGS_DATABASE_ID,
+  // Tous les combien de secondes relire les réglages dans Notion (défaut:
+  // 120, minimum 5). Sous 60, chaque vérification d'une minute relit Notion.
+  SETTINGS_REFRESH_SECONDS = '120',
 
   // Valeurs PAR DÉFAUT de l'envoi quotidien. Elles servent quand la base
   // Réglages n'est pas configurée ou est illisible.
@@ -193,8 +196,10 @@ async function loadSettingsFromNotion() {
   return parseSettingsPage(data.results[0]);
 }
 
-const SETTINGS_CACHE_MS = 2 * 60 * 1000; // relecture de Notion au plus toutes les 2 min
-const SETTINGS_RETRY_MS = 30 * 1000; // nouvel essai après un échec
+const refreshSeconds = Number(SETTINGS_REFRESH_SECONDS);
+const SETTINGS_CACHE_MS =
+  (Number.isFinite(refreshSeconds) && refreshSeconds >= 5 ? refreshSeconds : 120) * 1000;
+const SETTINGS_RETRY_MS = Math.min(30 * 1000, SETTINGS_CACHE_MS); // nouvel essai après un échec
 let settingsCache = { fetchedAt: 0, ttl: 0, value: null };
 let lastGoodSettings = null;
 let lastSettingsLog = '';
