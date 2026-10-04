@@ -186,27 +186,54 @@ let resolvedSettingsDatabaseId = null;
 
 const sameId = (a, b) => String(a).replace(/-/g, '').toLowerCase() === String(b).replace(/-/g, '').toLowerCase();
 
-async function findSettingsDatabaseId() {
-  const res = await fetch('https://api.notion.com/v1/search', {
-    method: 'POST',
-    headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
-    body: JSON.stringify({
-      query: SETTINGS_DATABASE_TITLE,
-      filter: { property: 'object', value: 'database' },
-      page_size: 25,
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(`La recherche de la base "${SETTINGS_DATABASE_TITLE}" a échoué (${res.status}).`);
+// Clé de comparaison de titres: sans majuscules, sans accents (quelle que soit
+// la façon dont ils sont codés), espaces normalisés.
+const titleKey = (s) =>
+  normalizeName(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ');
+
+// Liste toutes les bases visibles par l'intégration (sans dépendre de la
+// recherche floue de Notion: on filtre nous-mêmes).
+async function listAccessibleDatabases() {
+  const all = [];
+  let cursor;
+  for (let page = 0; page < 5; page++) {
+    const res = await fetch('https://api.notion.com/v1/search', {
+      method: 'POST',
+      headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
+      body: JSON.stringify({
+        filter: { property: 'object', value: 'database' },
+        page_size: 100,
+        ...(cursor ? { start_cursor: cursor } : {}),
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`La recherche des bases a échoué (${res.status}).`);
+    }
+    const data = await res.json();
+    all.push(...(data.results || []));
+    if (!data.has_more || !data.next_cursor) break;
+    cursor = data.next_cursor;
   }
-  const data = await res.json();
-  const wanted = normalizeName(SETTINGS_DATABASE_TITLE);
-  const matches = (data.results || []).filter(
-    (db) => normalizeName((db.title || []).map((t) => t.plain_text).join('')) === wanted
-  );
+  return all.map((db) => ({
+    id: db.id,
+    title: (db.title || []).map((t) => t.plain_text).join(''),
+  }));
+}
+
+async function findSettingsDatabaseId() {
+  const databases = await listAccessibleDatabases();
+  const wanted = titleKey(SETTINGS_DATABASE_TITLE);
+  const exact = databases.filter((db) => titleKey(db.title) === wanted);
+  const partial = databases.filter((db) => titleKey(db.title).includes(wanted));
+  const matches = exact.length ? exact : partial.length === 1 ? partial : [];
+
   if (matches.length === 0) {
+    const seen = databases.length
+      ? databases.slice(0, 10).map((db) => `"${db.title || '(sans titre)'}"`).join(', ')
+      : 'aucune';
     throw new Error(
-      `Aucune base nommée "${SETTINGS_DATABASE_TITLE}" n'est accessible à l'intégration (vérifie Settings > Connections > Manage page access).`
+      `Aucune base nommée "${SETTINGS_DATABASE_TITLE}" n'est visible par l'intégration. Bases visibles: ${seen}. ` +
+        `(vérifie Settings > Connections > Manage page access)`
     );
   }
   if (matches.length > 1) {
