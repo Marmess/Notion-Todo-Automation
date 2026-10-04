@@ -217,27 +217,43 @@ async function listAccessibleDatabases() {
   return all.map((db) => ({
     id: db.id,
     title: (db.title || []).map((t) => t.plain_text).join(''),
+    propertyNames: Object.keys(db.properties || {}),
   }));
 }
 
 async function findSettingsDatabaseId() {
   const databases = await listAccessibleDatabases();
+
+  // 1) Par les colonnes: la base qui a "Fuseau horaire" et "Heure d'envoi".
+  //    C'est le plus fiable: ça marche même si la base n'a pas de titre.
+  const needed = ['Fuseau horaire', "Heure d'envoi"].map(titleKey);
+  const bySchema = databases.filter((db) => {
+    const names = db.propertyNames.map(titleKey);
+    return needed.every((n) => names.includes(n));
+  });
+
+  // 2) Sinon, par le titre.
   const wanted = titleKey(SETTINGS_DATABASE_TITLE);
   const exact = databases.filter((db) => titleKey(db.title) === wanted);
   const partial = databases.filter((db) => titleKey(db.title).includes(wanted));
-  const matches = exact.length ? exact : partial.length === 1 ? partial : [];
+  const byTitle = exact.length ? exact : partial.length === 1 ? partial : [];
+
+  const matches = bySchema.length ? bySchema : byTitle;
 
   if (matches.length === 0) {
-    const seen = databases.length
-      ? databases.slice(0, 10).map((db) => `"${db.title || '(sans titre)'}"`).join(', ')
-      : 'aucune';
+    const preview = (db) => {
+      const cols = db.propertyNames.slice(0, 5).join(', ');
+      const more = db.propertyNames.length > 5 ? `, +${db.propertyNames.length - 5}` : '';
+      return `"${db.title || '(sans titre)'}" [${cols}${more}]`;
+    };
+    const seen = databases.length ? databases.slice(0, 10).map(preview).join(' ; ') : 'aucune';
     throw new Error(
-      `Aucune base nommée "${SETTINGS_DATABASE_TITLE}" n'est visible par l'intégration. Bases visibles: ${seen}. ` +
-        `(vérifie Settings > Connections > Manage page access)`
+      `Aucune base de réglages trouvée (colonnes "Fuseau horaire" et "Heure d'envoi", ou titre "${SETTINGS_DATABASE_TITLE}"). ` +
+        `Bases visibles: ${seen}. (vérifie Settings > Connections > Manage page access)`
     );
   }
   if (matches.length > 1) {
-    console.warn(`⚠️ ${matches.length} bases nommées "${SETTINGS_DATABASE_TITLE}" trouvées, la première est utilisée.`);
+    console.warn(`⚠️ ${matches.length} bases de réglages trouvées, la première est utilisée.`);
   }
   return matches[0].id;
 }
@@ -272,7 +288,7 @@ async function loadSettingsFromNotion() {
     if (!sameId(foundId, id)) {
       resolvedSettingsDatabaseId = foundId;
       console.log(
-        `ℹ️ Base "${SETTINGS_DATABASE_TITLE}" trouvée par son titre (id: ${foundId}). Tu peux mettre cet identifiant dans NOTION_SETTINGS_DATABASE_ID.`
+        `ℹ️ Base des réglages trouvée automatiquement (id: ${foundId}). Tu peux mettre cet identifiant dans NOTION_SETTINGS_DATABASE_ID.`
       );
       res = await querySettingsDatabase(foundId);
     }
