@@ -73,6 +73,8 @@ const {
   // cocher plusieurs tâches d'affilée ne donne qu'un seul courriel.
   CHECK_EMAIL_DELAY_SECONDS = '15',
 
+  // Adresse ouverte en cliquant sur le titre CALENDRIER du courriel (vide = pas de lien).
+  CALENDAR_LINK = 'https://calendar.notion.so',
   // Section CALENDRIER du courriel: événements d'aujourd'hui de la base Notion
   // (colonne Dates avec une heure) et de Google Agenda.
   CALENDAR_ENABLED = 'true',
@@ -1288,6 +1290,19 @@ async function fetchGoogleCalendarItems(bounds) {
   return { items, failures };
 }
 
+const calendarHeadingUrl = (() => {
+  const raw = String(CALENDAR_LINK ?? '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    if (u.protocol === 'https:' || u.protocol === 'http:') return raw;
+  } catch {
+    /* lien invalide: avertissement ci-dessous */
+  }
+  console.warn(`⚠️ CALENDAR_LINK est illisible ("${raw.slice(0, 60)}"): le titre CALENDRIER ne sera pas un lien.`);
+  return '';
+})();
+
 const compareCalendarItems = (a, b) =>
   Number(b.allDay) - Number(a.allDay) || a.start - b.start || a.title.localeCompare(b.title, 'fr');
 
@@ -1397,23 +1412,28 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
       item.allDay ? 'Toute la journée' : item.continued ? `jusqu'à ${formatClock(item.endsAt, tz)}` : formatClock(item.start, tz);
     textParts.push(
       [
-        'CALENDRIER',
+        '\nCALENDRIER',
         ...calendarItems.map((i) => `${whenOf(i)} - ${i.title} (${i.source})`),
         ...calendarNotes.map((n) => `⚠️ ${n}`),
       ].join('\n')
     );
     const lis = calendarItems
       .map((i) => {
-        const title = i.url
-          ? `<a href="${escapeHtml(i.url)}" style="text-decoration:none;color:#111;">${escapeHtml(i.title)}</a>`
-          : escapeHtml(i.title);
-        return `<li>${escapeHtml(whenOf(i))} - ${title} <span style="color:#888;font-size:12px;">(${escapeHtml(i.source)})</span></li>`;
+        // L'heure ET le nom sont dans le même lien.
+        const label = `${escapeHtml(whenOf(i))} - ${escapeHtml(i.title)}`;
+        const linked = i.url
+          ? `<a href="${escapeHtml(i.url)}" style="text-decoration:none;color:#111;">${label}</a>`
+          : label;
+        return `<li>${linked} <span style="color:#888;font-size:12px;">(${escapeHtml(i.source)})</span></li>`;
       })
       .join('\n');
     const notesHtml = calendarNotes
       .map((n) => `<p style="color:#888;font-size:12px;margin:4px 0;">⚠️ ${escapeHtml(n)}</p>`)
       .join('\n');
-    htmlParts.push(`<h2>CALENDRIER</h2>\n${lis ? `<ul style="line-height:1.8;margin-top:0;">${lis}</ul>` : ''}\n${notesHtml}`);
+    const heading = calendarHeadingUrl
+      ? `<a href="${escapeHtml(calendarHeadingUrl)}" style="text-decoration:none;color:inherit;">CALENDRIER</a>`
+      : 'CALENDRIER';
+    htmlParts.push(`<br>\n<h2>${heading}</h2>\n${lis ? `<ul style="line-height:1.8;margin-top:0;">${lis}</ul>` : ''}\n${notesHtml}`);
   }
 
   return {
