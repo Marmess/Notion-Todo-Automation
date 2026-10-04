@@ -43,7 +43,14 @@ const {
   // (par défaut: ta propre adresse, MAIL_TO). Les autres sont ignorés.
   ALLOWED_SENDER_EMAIL = MAIL_TO,
 
-  // Planification du cron (par défaut: tous les jours à 8h00)
+  // ID de la base Notion "Réglages" (fuseau horaire, heure d'envoi, envoi
+  // actif). Optionnel: sans cette variable, les valeurs ci-dessous sont
+  // utilisées telles quelles.
+  NOTION_SETTINGS_DATABASE_ID,
+
+  // Valeurs PAR DÉFAUT de l'envoi quotidien. Elles servent quand la base
+  // Réglages n'est pas configurée ou est illisible.
+  // CRON_SCHEDULE: seule l'heure compte (ex: '0 7 * * *' = 07:00).
   CRON_SCHEDULE = '0 8 * * *',
   CRON_TIMEZONE = 'America/Toronto',
   ENABLE_CRON = 'true',
@@ -68,6 +75,207 @@ const NOTION_HEADERS = {
   'Notion-Version': NOTION_VERSION,
   'Content-Type': 'application/json',
 };
+
+// ---------------------------------------------------------------------------
+// Réglages lus depuis Notion: fuseau horaire, heure d'envoi, envoi actif
+// ---------------------------------------------------------------------------
+// Fuseau actif: celui des réglages Notion (ou CRON_TIMEZONE par défaut).
+// Il sert à la date du courriel, au "dans X jours" et à la date des tâches
+// créées par courriel.
+let activeTimezone = CRON_TIMEZONE;
+function currentTimezone() {
+  return activeTimezone;
+}
+
+function isValidTimezone(tz) {
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Accepte '7:00', '07:00', '7h00', '07h30'... et renvoie 'HH:MM', sinon null.
+function parseSendTime(raw) {
+  const m = /^\s*([01]?\d|2[0-3])\s*[:hH]\s*([0-5]\d)\s*$/.exec(raw || '');
+  return m ? `${m[1].padStart(2, '0')}:${m[2]}` : null;
+}
+
+// Heure par défaut déduite de CRON_SCHEDULE (ex: '0 7 * * *' => '07:00').
+function defaultSendTime() {
+  const m = /^\s*(\d{1,2})\s+(\d{1,2})\s+\*\s+\*\s+\*\s*$/.exec(CRON_SCHEDULE);
+  if (m) {
+    const parsed = parseSendTime(`${m[2]}:${m[1].padStart(2, '0')}`);
+    if (parsed) return parsed;
+  }
+  return '07:00';
+}
+
+function defaultSettings() {
+  return {
+    timezone: CRON_TIMEZONE,
+    sendTime: defaultSendTime(),
+    active: true,
+    source: 'valeurs par défaut',
+    warnings: [],
+  };
+}
+
+function normalizeName(s) {
+  return String(s || '').replace(/[’‘`´]/g, "'").trim().toLowerCase();
+}
+
+// Trouve une propriété par son nom, sans se soucier des majuscules ni du
+// type d'apostrophe (' ou ’).
+function findProperty(properties, wantedName) {
+  const wanted = normalizeName(wantedName);
+  const key = Object.keys(properties || {}).find((k) => normalizeName(k) === wanted);
+  return key ? properties[key] : undefined;
+}
+
+function propText(prop) {
+  if (!prop) return '';
+  if (prop.type === 'select') return prop.select?.name || '';
+  if (prop.type === 'rich_text') return (prop.rich_text || []).map((t) => t.plain_text).join('');
+  if (prop.type === 'title') return (prop.title || []).map((t) => t.plain_text).join('');
+  return '';
+}
+
+function parseSettingsPage(page) {
+  const props = page.properties || {};
+  const defaults = defaultSettings();
+  const warnings = [];
+
+  let timezone = defaults.timezone;
+  const tzRaw = propText(findProperty(props, 'Fuseau horaire')).trim();
+  if (tzRaw) {
+    if (isValidTimezone(tzRaw)) {
+      timezone = tzRaw;
+    } else {
+      warnings.push(`Fuseau horaire inconnu "${tzRaw}" (utilise un nom officiel comme Europe/Paris): ${timezone} conservé.`);
+    }
+  }
+
+  let sendTime = defaults.sendTime;
+  const timeRaw = propText(findProperty(props, "Heure d'envoi")).trim();
+  if (timeRaw) {
+    const parsed = parseSendTime(timeRaw);
+    if (parsed) {
+      sendTime = parsed;
+    } else {
+      warnings.push(`Heure d'envoi illisible "${timeRaw}" (écris par exemple 07:00): ${sendTime} conservée.`);
+    }
+  }
+
+  // Case décochée = envoi suspendu. Si la propriété n'existe pas, on envoie.
+  const activeProp = findProperty(props, 'Envoi actif');
+  const active = activeProp?.type === 'checkbox' ? activeProp.checkbox === true : true;
+
+  return { timezone, sendTime, active, source: 'Notion', warnings };
+}
+
+async function loadSettingsFromNotion() {
+  // L'ancienne version d'API (2022-06-28) est la plus simple pour lire la
+  // première ligne d'une base ordinaire.
+  const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_SETTINGS_DATABASE_ID}/query`, {
+    method: 'POST',
+    headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
+    body: JSON.stringify({ page_size: 1 }),
+  });
+  if (!res.ok) {
+    throw new Error(`Notion (réglages) a répondu ${res.status}: ${await res.text()}`);
+  }
+  const data = await res.json();
+  if (!data.results || data.results.length === 0) {
+    throw new Error('La base Réglages est vide (ajoute une ligne).');
+  }
+  return parseSettingsPage(data.results[0]);
+}
+
+const SETTINGS_CACHE_MS = 2 * 60 * 1000; // relecture de Notion au plus toutes les 2 min
+const SETTINGS_RETRY_MS = 30 * 1000; // nouvel essai après un échec
+let settingsCache = { fetchedAt: 0, ttl: 0, value: null };
+let lastGoodSettings = null;
+let lastSettingsLog = '';
+let lastSettingsError = '';
+
+// Ne lance jamais d'erreur: en cas de problème, garde les derniers réglages
+// connus (ou les valeurs par défaut si on n'en a jamais eu).
+async function getSettings() {
+  if (settingsCache.value && Date.now() - settingsCache.fetchedAt < settingsCache.ttl) {
+    return settingsCache.value;
+  }
+
+  let value;
+  let ttl = SETTINGS_CACHE_MS;
+  if (!NOTION_SETTINGS_DATABASE_ID) {
+    value = defaultSettings();
+  } else {
+    try {
+      value = await loadSettingsFromNotion();
+      lastGoodSettings = value;
+      lastSettingsError = '';
+    } catch (err) {
+      value = lastGoodSettings || defaultSettings();
+      ttl = SETTINGS_RETRY_MS;
+      if (err.message !== lastSettingsError) {
+        lastSettingsError = err.message;
+        console.error(
+          `⚠️ Réglages Notion illisibles (${lastGoodSettings ? 'derniers réglages connus conservés' : 'valeurs par défaut utilisées'}): ${err.message}`
+        );
+      }
+    }
+  }
+
+  settingsCache = { fetchedAt: Date.now(), ttl, value };
+  activeTimezone = value.timezone;
+
+  // On n'écrit dans les logs que quand les réglages changent.
+  const logKey = `${value.timezone}|${value.sendTime}|${value.active}|${value.warnings.join(';')}`;
+  if (logKey !== lastSettingsLog) {
+    lastSettingsLog = logKey;
+    console.log(
+      `⚙️ Réglages (${value.source}): fuseau=${value.timezone}, heure d'envoi=${value.sendTime}, envoi ${value.active ? 'actif' : 'SUSPENDU'}`
+    );
+    value.warnings.forEach((w) => console.warn(`⚠️ ${w}`));
+  }
+  return value;
+}
+
+// Heure (HH:MM) et date (YYYY-MM-DD) d'un instant, dans un fuseau donné.
+function timeInZone(date, timeZone) {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(date);
+}
+function dateInZone(date, timeZone) {
+  return date.toLocaleDateString('en-CA', { timeZone });
+}
+
+// Appelée chaque minute: envoie le résumé si l'heure et le fuseau des
+// réglages correspondent, une seule fois par jour.
+let lastSentKey = '';
+async function schedulerTick() {
+  const now = new Date();
+  try {
+    const settings = await getSettings();
+    if (!settings.active) return;
+    if (timeInZone(now, settings.timezone) !== settings.sendTime) return;
+
+    const key = `${dateInZone(now, settings.timezone)} ${settings.sendTime} ${settings.timezone}`;
+    if (key === lastSentKey) return;
+    lastSentKey = key;
+
+    console.log(`⏰ Envoi du résumé (${settings.sendTime}, ${settings.timezone})...`);
+    await sendTasksEmail();
+  } catch (err) {
+    console.error('Erreur cron:', err);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Vérification de la signature des webhooks Resend (format Svix)
@@ -156,9 +364,10 @@ function textToNotionBlocks(text) {
 // ---------------------------------------------------------------------------
 async function createNotionTaskFromEmail(subject, bodyContent) {
   const title = (subject || '(sans sujet)').trim();
+  await getSettings(); // fuseau à jour pour la date du jour
 
   // Date d'aujourd'hui (selon le fuseau configuré), au format YYYY-MM-DD
-  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE });
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: currentTimezone() });
 
   const res = await fetch('https://api.notion.com/v1/pages', {
     method: 'POST',
@@ -263,7 +472,7 @@ function extractCalendarDate(isoDate) {
   const d = new Date(isoDate);
   if (isNaN(d.getTime())) return null;
   // 'en-CA' donne le format YYYY-MM-DD, pratique à re-découper
-  const parts = d.toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE }).split('-');
+  const parts = d.toLocaleDateString('en-CA', { timeZone: currentTimezone() }).split('-');
   return { year: Number(parts[0]), month: Number(parts[1]), day: Number(parts[2]) };
 }
 
@@ -273,7 +482,7 @@ function daysUntilDue(isoDate) {
   const due = extractCalendarDate(isoDate);
   if (!due) return null;
 
-  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: CRON_TIMEZONE });
+  const todayStr = new Date().toLocaleDateString('en-CA', { timeZone: currentTimezone() });
   const [ty, tm, td] = todayStr.split('-').map(Number);
 
   const dueUTC = Date.UTC(due.year, due.month - 1, due.day);
@@ -314,7 +523,7 @@ function formatDueDate(isoDate) {
   return d.toLocaleDateString('fr-CA', {
     day: 'numeric',
     month: 'short',
-    timeZone: CRON_TIMEZONE,
+    timeZone: currentTimezone(),
   });
 }
 
@@ -390,7 +599,7 @@ function buildEmailContent(tasks) {
     year: 'numeric',
     month: 'long',
     day: 'numeric',
-    timeZone: CRON_TIMEZONE,
+    timeZone: currentTimezone(),
   });
 
   if (tasks.length === 0) {
@@ -457,6 +666,7 @@ function buildEmailContent(tasks) {
 }
 
 async function sendTasksEmail() {
+  await getSettings(); // fuseau à jour pour les dates du courriel
   const tasks = await fetchViewTasks();
   const { subject, text, html } = buildEmailContent(tasks);
 
@@ -572,16 +782,30 @@ app.get('/send-tasks', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Serveur démarré sur le port ${PORT}`);
+// Le serveur ne démarre que si le fichier est lancé directement
+// (`node index.js`), ce qui permet aussi de le tester sans l'ouvrir au réseau.
+if (require.main === module) {
+  app.listen(PORT, async () => {
+    console.log(`🚀 Serveur démarré sur le port ${PORT}`);
 
-  if (ENABLE_CRON === 'true') {
-    cron.schedule(CRON_SCHEDULE, () => {
-      console.log('⏰ Déclenchement du cron quotidien...');
-      sendTasksEmail().catch((err) => console.error('Erreur cron:', err));
-    }, { timezone: CRON_TIMEZONE });
-    console.log(`🕐 Cron activé: "${CRON_SCHEDULE}" (${CRON_TIMEZONE})`);
-  } else {
-    console.log('🕐 Cron désactivé (ENABLE_CRON=false)');
-  }
-});
+    if (ENABLE_CRON === 'true') {
+      await getSettings(); // charge (et journalise) les réglages tout de suite
+      cron.schedule('* * * * *', schedulerTick);
+      console.log('🕐 Planificateur actif (vérification chaque minute)');
+    } else {
+      console.log('🕐 Cron désactivé (ENABLE_CRON=false)');
+    }
+  });
+}
+
+module.exports = {
+  parseSendTime,
+  defaultSendTime,
+  parseSettingsPage,
+  getSettings,
+  schedulerTick,
+  timeInZone,
+  dateInZone,
+  currentTimezone,
+  createNotionTaskFromEmail,
+};
