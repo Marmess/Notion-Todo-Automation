@@ -425,6 +425,24 @@ function verifyNotionWebhook(rawBody, signature) {
   return expected.length === received.length && crypto.timingSafeEqual(expected, received);
 }
 
+// Cherche un "verification_token" n'importe où dans le corps (peu importe la
+// version du format des événements).
+function findVerificationToken(obj, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 4) return null;
+  for (const [key, value] of Object.entries(obj)) {
+    if (key.toLowerCase() === 'verification_token' && typeof value === 'string' && value) return value;
+    const nested = findVerificationToken(value, depth + 1);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+// Aperçu court et sans danger d'une requête ignorée, pour les logs.
+function previewRequest(req, rawBody) {
+  const text = rawBody.toString('utf8').replace(/\s+/g, ' ');
+  return `en-têtes=[${Object.keys(req.headers).join(', ')}] signature=${req.headers['x-notion-signature'] ? 'oui' : 'non'} corps=${text.slice(0, 400)}${text.length > 400 ? '…' : ''}`;
+}
+
 const safeDecode = (s) => {
   try {
     return decodeURIComponent(String(s));
@@ -1040,18 +1058,21 @@ app.post('/notion-webhook', express.raw({ type: () => true }), async (req, res) 
     return res.status(400).json({ error: 'JSON invalide' });
   }
 
-  if (!signature && event.verification_token) {
-    console.log(`🔑 Jeton de vérification Notion reçu: ${event.verification_token}`);
+  // Prise de contact de Notion: la requête contient le jeton de vérification
+  // (elle peut être signée avec ce même jeton, donc on ne regarde pas la signature).
+  const verificationToken = findVerificationToken(event);
+  if (verificationToken) {
+    console.log(`🔑 Jeton de vérification Notion reçu: ${verificationToken}`);
     console.log('   Colle-le dans Notion (bouton Verify) et dans la variable NOTION_WEBHOOK_SECRET.');
     return res.status(200).json({ received: true });
   }
 
   if (!NOTION_WEBHOOK_SECRET) {
-    console.log('↪ Événement Notion ignoré: NOTION_WEBHOOK_SECRET n\'est pas défini.');
+    console.log(`↪ Événement Notion ignoré: NOTION_WEBHOOK_SECRET n'est pas défini. ${previewRequest(req, rawBody)}`);
     return res.status(200).json({ received: true });
   }
   if (!verifyNotionWebhook(rawBody, signature)) {
-    console.error('❌ Signature webhook Notion invalide, requête ignorée.');
+    console.error(`❌ Signature webhook Notion invalide, requête ignorée. ${previewRequest(req, rawBody)}`);
     return res.status(401).json({ error: 'Signature invalide' });
   }
 
