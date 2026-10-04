@@ -74,6 +74,7 @@ const {
   CHECK_EMAIL_DELAY_SECONDS = '15',
 
   // Adresse ouverte en cliquant sur le titre CALENDRIER du courriel (vide = pas de lien).
+  // Lien web (https://calendar.notion.so) ou lien qui ouvre l'application (cron://).
   CALENDAR_LINK = 'https://calendar.notion.so',
   // Section CALENDRIER du courriel: événements d'aujourd'hui de la base Notion
   // (colonne Dates avec une heure) et de Google Agenda.
@@ -1290,16 +1291,19 @@ async function fetchGoogleCalendarItems(bounds) {
   return { items, failures };
 }
 
+// Adresses refusées dans un lien de courriel (script ou contenu intégré).
+const BLOCKED_LINK_SCHEMES = new Set(['javascript:', 'data:', 'vbscript:', 'file:', 'blob:', 'about:']);
 const calendarHeadingUrl = (() => {
   const raw = String(CALENDAR_LINK ?? '').trim();
   if (!raw) return '';
   try {
     const u = new URL(raw);
-    if (u.protocol === 'https:' || u.protocol === 'http:') return raw;
+    // Les liens web et ceux d'une application (cron://) sont acceptés.
+    if (!BLOCKED_LINK_SCHEMES.has(u.protocol.toLowerCase())) return raw;
   } catch {
     /* lien invalide: avertissement ci-dessous */
   }
-  console.warn(`⚠️ CALENDAR_LINK est illisible ("${raw.slice(0, 60)}"): le titre CALENDRIER ne sera pas un lien.`);
+  console.warn(`⚠️ CALENDAR_LINK est illisible ou refusé ("${raw.slice(0, 60)}"): le titre CALENDRIER ne sera pas un lien.`);
   return '';
 })();
 
