@@ -66,8 +66,9 @@ const {
   // NOTION_WEBHOOK_SECRET: jeton de vérification fourni par Notion. Sans lui,
   // la fonction est inactive.
   NOTION_WEBHOOK_SECRET,
-  // Colonne case à cocher qui marque une tâche comme faite.
-  NOTION_DONE_CHECKBOX_PROPERTY = 'Todo',
+  // Colonne qui marque une tâche comme faite: vraie case à cocher, ou statut
+  // (affiché ou non comme une case; "terminé" = groupe Complete du statut).
+  NOTION_DONE_PROPERTY = 'Todo',
   // Délai (secondes) avant l'envoi, remis à zéro à chaque nouvelle case cochée:
   // cocher plusieurs tâches d'affilée ne donne qu'un seul courriel.
   CHECK_EMAIL_DELAY_SECONDS = '15',
@@ -480,10 +481,65 @@ function scheduleCheckUpdateEmail() {
   }, CHECK_EMAIL_DELAY_MS);
 }
 
-// Décide si un événement "page.properties_updated" correspond à une case Todo
-// qu'on vient de COCHER dans la bonne base. Journalise la raison de chaque rejet.
+// Noms de statut considérés comme "terminé" (accents et majuscules ignorés).
+const DONE_NAME_PATTERN = /^(done|complete|completed|finished|termine|terminee|fait|faite|fini|finie)\b/;
+const isDoneName = (name) => DONE_NAME_PATTERN.test(titleKey(name));
+
+// Un statut Notion est rangé en 3 groupes (À faire / En cours / Terminé). Une
+// case "cochée" correspond à une option du groupe Terminé: on lit ce groupe
+// dans la base (gardé en mémoire 10 min).
+let doneOptionsCache = { at: 0, ids: null };
+async function getDoneStatusOptionIds() {
+  if (!NOTION_DATABASE_ID) return null;
+  if (doneOptionsCache.ids && Date.now() - doneOptionsCache.at < 10 * 60 * 1000) {
+    return doneOptionsCache.ids;
+  }
+  try {
+    const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}`, {
+      headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
+    });
+    if (!res.ok) throw new Error(`Notion a répondu ${res.status}`);
+    const db = await res.json();
+    const prop = findProperty(db.properties, NOTION_DONE_PROPERTY);
+    const groups = prop?.type === 'status' ? prop.status?.groups || [] : [];
+    // Le groupe "Terminé" est reconnu par son nom, sinon c'est le dernier.
+    const group = groups.find((g) => isDoneName(g.name)) || groups[groups.length - 1];
+    const ids = new Set(group?.option_ids || []);
+    if (ids.size === 0) return null;
+    doneOptionsCache = { at: Date.now(), ids };
+    return ids;
+  } catch (err) {
+    console.warn(`⚠️ Groupes du statut "${NOTION_DONE_PROPERTY}" illisibles (${err.message}): le nom du statut est utilisé à la place.`);
+    return null;
+  }
+}
+
+// Dit si la colonne indique "terminé", et décrit sa valeur pour les logs.
+// Renvoie null si le type de colonne n'est pas géré.
+async function readDoneState(prop) {
+  if (prop.type === 'checkbox') {
+    return { done: prop.checkbox === true, label: prop.checkbox ? 'case cochée' : 'case décochée' };
+  }
+  if (prop.type === 'status') {
+    const name = prop.status?.name || '';
+    const ids = await getDoneStatusOptionIds();
+    const done = ids ? ids.has(prop.status?.id) : isDoneName(name);
+    return { done, label: `statut "${name}"` };
+  }
+  if (prop.type === 'select') {
+    const name = prop.select?.name || '';
+    return { done: isDoneName(name), label: `choix "${name}"` };
+  }
+  return null;
+}
+
+// Décide si un événement "page.properties_updated" correspond à une tâche qu'on
+// vient de TERMINER dans la bonne base. Journalise la raison de chaque rejet.
 async function handleNotionEvent(event) {
-  if (event.type !== 'page.properties_updated') return;
+  if (event.type !== 'page.properties_updated') {
+    console.log(`↪ Événement Notion ignoré: type "${event.type}" (seul page.properties_updated est utilisé).`);
+    return;
+  }
 
   const pageId = event.entity?.id;
   const updated = event.data?.updated_properties;
@@ -503,25 +559,31 @@ async function handleNotionEvent(event) {
   const page = await res.json();
 
   if (NOTION_DATABASE_ID && !sameNotionId(page.parent?.database_id, NOTION_DATABASE_ID)) {
-    console.log('↪ Événement Notion ignoré: la page n\'est pas dans la base Todo.');
+    console.log("↪ Événement Notion ignoré: la page n'est pas dans la base Todo.");
     return;
   }
 
-  const checkbox = findProperty(page.properties, NOTION_DONE_CHECKBOX_PROPERTY);
-  if (!checkbox || checkbox.type !== 'checkbox') {
-    console.warn(`↪ Événement Notion ignoré: colonne "${NOTION_DONE_CHECKBOX_PROPERTY}" (case à cocher) introuvable.`);
+  const prop = findProperty(page.properties, NOTION_DONE_PROPERTY);
+  if (!prop) {
+    console.warn(`↪ Événement Notion ignoré: colonne "${NOTION_DONE_PROPERTY}" introuvable.`);
     return;
   }
-  if (!updated.map(safeDecode).includes(safeDecode(checkbox.id))) {
-    console.log(`↪ Événement Notion ignoré: la colonne "${NOTION_DONE_CHECKBOX_PROPERTY}" n'a pas changé.`);
-    return;
-  }
-  if (checkbox.checkbox !== true) {
-    console.log('↪ Événement Notion ignoré: case décochée.');
+  if (!updated.map(safeDecode).includes(safeDecode(prop.id))) {
+    console.log(`↪ Événement Notion ignoré: la colonne "${NOTION_DONE_PROPERTY}" n'a pas changé.`);
     return;
   }
 
-  console.log(`🔔 Case "${NOTION_DONE_CHECKBOX_PROPERTY}" cochée: mise à jour dans ${CHECK_EMAIL_DELAY_MS / 1000} s.`);
+  const state = await readDoneState(prop);
+  if (!state) {
+    console.warn(`↪ Événement Notion ignoré: la colonne "${NOTION_DONE_PROPERTY}" est de type "${prop.type}" (gérés: case à cocher, statut, choix).`);
+    return;
+  }
+  if (!state.done) {
+    console.log(`↪ Événement Notion ignoré: "${NOTION_DONE_PROPERTY}" n'est pas terminée (${state.label}).`);
+    return;
+  }
+
+  console.log(`🔔 "${NOTION_DONE_PROPERTY}" terminée (${state.label}): mise à jour dans ${CHECK_EMAIL_DELAY_MS / 1000} s.`);
   scheduleCheckUpdateEmail();
 }
 
