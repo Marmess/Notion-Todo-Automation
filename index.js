@@ -73,6 +73,15 @@ const {
   // cocher plusieurs tâches d'affilée ne donne qu'un seul courriel.
   CHECK_EMAIL_DELAY_SECONDS = '15',
 
+  // Section CALENDRIER du courriel: événements d'aujourd'hui de la base Notion
+  // (colonne Dates avec une heure) et de Google Agenda.
+  CALENDAR_ENABLED = 'true',
+  // Clé JSON d'un compte de service Google (contenu du fichier, ou ce contenu
+  // encodé en base64) et agendas à lire (adresses ou identifiants séparés par
+  // des virgules). Chaque agenda doit être partagé avec le compte de service.
+  GOOGLE_SERVICE_ACCOUNT_JSON,
+  GOOGLE_CALENDAR_IDS,
+
   // Valeurs PAR DÉFAUT de l'envoi quotidien. Elles servent quand la base
   // Réglages n'est pas configurée ou est illisible.
   // CRON_SCHEDULE: seule l'heure compte (ex: '0 7 * * *' = 07:00).
@@ -873,6 +882,7 @@ async function fetchViewTasks() {
   );
 
   return fullPages.map((page) => ({
+    id: page.id,
     title: extractTitle(page),
     url: taskLink(page),
     due: extractDueDate(page),
@@ -883,23 +893,266 @@ async function fetchViewTasks() {
 // ---------------------------------------------------------------------------
 // Construit et envoie le courriel
 // ---------------------------------------------------------------------------
-function buildEmailContent(tasks) {
+// ---------------------------------------------------------------------------
+// Calendrier: événements d'aujourd'hui (Notion + Google Agenda)
+// ---------------------------------------------------------------------------
+const escapeHtml = (value) =>
+  String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// Décalage (en ms) entre l'heure locale d'un fuseau et UTC, à un instant donné.
+function tzOffsetMs(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    hourCycle: 'h23',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).formatToParts(date);
+  const v = Object.fromEntries(parts.map((p) => [p.type, p.value]));
+  const asUtc = Date.UTC(+v.year, +v.month - 1, +v.day, +v.hour, +v.minute, +v.second);
+  return asUtc - Math.floor(date.getTime() / 1000) * 1000;
+}
+
+// Instant UTC qui correspond à une heure "murale" (année, mois, jour, heure...)
+// dans un fuseau. Le second passage corrige les jours de changement d'heure.
+function zonedWallTimeToDate(y, mo, d, h, mi, s, timeZone) {
+  const guess = Date.UTC(y, mo - 1, d, h, mi, s);
+  let t = guess - tzOffsetMs(new Date(guess), timeZone);
+  t = guess - tzOffsetMs(new Date(t), timeZone);
+  return new Date(t);
+}
+
+// Début (inclus) et fin (exclue) de la journée courante dans un fuseau.
+function dayBounds(now, timeZone) {
+  const dateStr = dateInZone(now, timeZone);
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const next = new Date(Date.UTC(y, m - 1, d + 1));
+  return {
+    dateStr,
+    start: zonedWallTimeToDate(y, m, d, 0, 0, 0, timeZone),
+    end: zonedWallTimeToDate(next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate(), 0, 0, 0, timeZone),
+  };
+}
+
+// "9:00", "14:30" (24 h, sans zéro devant l'heure), dans le fuseau actif.
+function formatClock(date, timeZone) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: 'numeric',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const hour = parts.find((p) => p.type === 'hour').value;
+  const minute = parts.find((p) => p.type === 'minute').value;
+  return `${Number(hour)}:${minute}`;
+}
+
+// Date Notion avec heure: soit avec un décalage (…-04:00 / Z), soit sans
+// décalage avec un fuseau (time_zone), soit sans rien (fuseau actif).
+function parseNotionDateTime(start, timeZone) {
+  if (/(Z|[+-]\d{2}:?\d{2})$/i.test(start)) return new Date(start);
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(start);
+  if (!m) return null;
+  return zonedWallTimeToDate(+m[1], +m[2], +m[3], +m[4], +m[5], +(m[6] || 0), timeZone);
+}
+
+// Éléments de la base Notion dont la colonne Dates a une HEURE aujourd'hui.
+// Sans heure, un élément reste une tâche.
+async function fetchNotionCalendarItems(bounds) {
+  const items = [];
+  const pageIds = new Set();
+  if (!NOTION_DATABASE_ID) return { items, pageIds };
+
+  let cursor;
+  for (let i = 0; i < 5; i++) {
+    const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}/query`, {
+      method: 'POST',
+      headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
+      body: JSON.stringify({
+        page_size: 100,
+        filter: {
+          and: [
+            { property: NOTION_TASK_DATE_PROPERTY, date: { on_or_after: bounds.start.toISOString() } },
+            { property: NOTION_TASK_DATE_PROPERTY, date: { before: bounds.end.toISOString() } },
+          ],
+        },
+        ...(cursor ? { start_cursor: cursor } : {}),
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error(`Notion (calendrier) a répondu ${res.status}: ${await res.text()}`);
+    const data = await res.json();
+
+    for (const page of data.results || []) {
+      const date = findProperty(page.properties, NOTION_TASK_DATE_PROPERTY)?.date;
+      if (!date?.start || !/T\d{2}:\d{2}/.test(date.start)) continue;
+      const start = parseNotionDateTime(date.start, date.time_zone || currentTimezone());
+      if (!start || start < bounds.start || start >= bounds.end) continue;
+      items.push({ source: 'Notion', title: extractTitle(page), url: taskLink(page), allDay: false, start });
+      pageIds.add(page.id);
+    }
+    if (!data.has_more || !data.next_cursor) break;
+    cursor = data.next_cursor;
+  }
+  return { items, pageIds };
+}
+
+// --- Google Agenda (compte de service, sans bibliothèque externe) ---
+function loadGoogleCredentials() {
+  const raw = (GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
+  if (!raw) return null;
+  try {
+    const json = raw.startsWith('{') ? raw : Buffer.from(raw, 'base64').toString('utf8');
+    const creds = JSON.parse(json);
+    if (!creds.client_email || !creds.private_key) throw new Error('client_email ou private_key manquant');
+    return { ...creds, private_key: String(creds.private_key).replace(/\\n/g, '\n') };
+  } catch (err) {
+    console.warn(`⚠️ GOOGLE_SERVICE_ACCOUNT_JSON illisible (${err.message}): Google Agenda désactivé.`);
+    return null;
+  }
+}
+const googleCredentials = loadGoogleCredentials();
+const googleCalendarIds = (GOOGLE_CALENDAR_IDS || '').split(',').map((id) => id.trim()).filter(Boolean);
+if (googleCredentials && googleCalendarIds.length === 0) {
+  console.warn('⚠️ GOOGLE_CALENDAR_IDS est vide: Google Agenda est ignoré (indique les adresses des agendas à lire).');
+}
+
+let googleToken = { value: '', expiresAt: 0 };
+async function getGoogleAccessToken() {
+  if (googleToken.value && Date.now() < googleToken.expiresAt - 60 * 1000) return googleToken.value;
+
+  const tokenUrl = googleCredentials.token_uri || 'https://oauth2.googleapis.com/token';
+  const nowSec = Math.floor(Date.now() / 1000);
+  const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const unsigned = `${b64({ alg: 'RS256', typ: 'JWT' })}.${b64({
+    iss: googleCredentials.client_email,
+    scope: 'https://www.googleapis.com/auth/calendar.readonly',
+    aud: tokenUrl,
+    iat: nowSec,
+    exp: nowSec + 3600,
+  })}`;
+  const signature = crypto.createSign('RSA-SHA256').update(unsigned).sign(googleCredentials.private_key).toString('base64url');
+
+  const res = await fetch(tokenUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion: `${unsigned}.${signature}`,
+    }).toString(),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) throw new Error(`Google (jeton) a répondu ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  googleToken = { value: data.access_token, expiresAt: Date.now() + (data.expires_in || 3600) * 1000 };
+  return googleToken.value;
+}
+
+async function googleGet(url) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const token = await getGoogleAccessToken();
+    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15000) });
+    if (res.status === 401 && attempt === 1) {
+      googleToken = { value: '', expiresAt: 0 }; // jeton refusé: on en redemande un
+      continue;
+    }
+    return res;
+  }
+}
+
+function googleEventToItem(ev, bounds) {
+  if (ev.status === 'cancelled') return null;
+  if ((ev.attendees || []).some((a) => a.self && a.responseStatus === 'declined')) return null;
+  const title = ev.summary || '(sans titre)';
+
+  // Toute la journée: comparaison de dates pures (la fin est exclue), pour ne
+  // pas confondre avec la veille ou le lendemain quand les fuseaux diffèrent.
+  if (ev.start?.date) {
+    const endDate = ev.end?.date || ev.start.date;
+    if (!(ev.start.date <= bounds.dateStr && bounds.dateStr < endDate)) return null;
+    return { source: 'Google', title, url: ev.htmlLink, allDay: true, start: bounds.start };
+  }
+
+  if (!ev.start?.dateTime) return null;
+  const start = new Date(ev.start.dateTime);
+  const end = ev.end?.dateTime ? new Date(ev.end.dateTime) : start;
+  if (end <= bounds.start || start >= bounds.end) return null;
+  const continued = start < bounds.start; // commencé hier, se poursuit aujourd'hui
+  return { source: 'Google', title, url: ev.htmlLink, allDay: false, start: continued ? bounds.start : start, endsAt: end, continued };
+}
+
+async function fetchGoogleCalendarItems(bounds) {
+  const items = [];
+  const failures = [];
+  for (const calendarId of googleCalendarIds) {
+    try {
+      const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${new URLSearchParams({
+        timeMin: bounds.start.toISOString(),
+        timeMax: bounds.end.toISOString(),
+        singleEvents: 'true',
+        orderBy: 'startTime',
+        maxResults: '100',
+        timeZone: currentTimezone(),
+      })}`;
+      const res = await googleGet(url);
+      if (!res.ok) throw new Error(`Google Agenda a répondu ${res.status} pour "${calendarId}": ${await res.text()}`);
+      const data = await res.json();
+      for (const ev of data.items || []) {
+        const item = googleEventToItem(ev, bounds);
+        if (item) items.push(item);
+      }
+    } catch (err) {
+      console.error(`⚠️ Google Agenda illisible: ${err.message}`);
+      failures.push(googleCalendarIds.length > 1 ? `Agenda Google « ${calendarId} » indisponible` : 'Agenda Google indisponible');
+    }
+  }
+  return { items, failures };
+}
+
+const compareCalendarItems = (a, b) =>
+  Number(b.allDay) - Number(a.allDay) || a.start - b.start || a.title.localeCompare(b.title, 'fr');
+
+// Lit les deux sources. Ne lance jamais d'erreur: une source en panne ajoute
+// seulement une mention dans la section, le courriel part quand même.
+async function fetchCalendar(bounds) {
+  const calendar = { items: [], notes: [], notionPageIds: new Set() };
+  if (CALENDAR_ENABLED !== 'true') return calendar;
+
+  try {
+    const notion = await fetchNotionCalendarItems(bounds);
+    calendar.items.push(...notion.items);
+    notion.pageIds.forEach((id) => calendar.notionPageIds.add(id));
+  } catch (err) {
+    console.error(`⚠️ Calendrier Notion illisible: ${err.message}`);
+    calendar.notes.push('Calendrier Notion indisponible');
+  }
+
+  if (googleCredentials && googleCalendarIds.length > 0) {
+    const google = await fetchGoogleCalendarItems(bounds);
+    calendar.items.push(...google.items);
+    calendar.notes.push(...google.failures);
+  }
+
+  calendar.items.sort(compareCalendarItems);
+  const count = (source) => calendar.items.filter((i) => i.source === source).length;
+  console.log(`📅 Calendrier: ${count('Notion')} événement(s) Notion, ${count('Google')} Google`);
+  return calendar;
+}
+
+function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
+  const tz = currentTimezone();
   const dateStr = new Date().toLocaleDateString('fr-CA', {
     weekday: 'long',
     year: 'numeric',
     month: 'long',
     day: 'numeric',
-    timeZone: currentTimezone(),
+    timeZone: tz,
   });
 
-  if (tasks.length === 0) {
-    return {
-      subject: `Tâches à faire — ${dateStr}`,
-      text: 'Aucune tâche à faire pour le moment.',
-      html: '<p>Aucune tâche à faire pour le moment.</p>',
-    };
-  }
-
+  // --- Tâches, groupées par priorité ---
   // Ordre des sections: "Non classé" d'abord, puis chaque niveau configuré,
   // puis (par sécurité) toute valeur inattendue rencontrée — ainsi aucune
   // tâche ne disparaît du courriel si une valeur n'est pas dans la liste.
@@ -923,32 +1176,65 @@ function buildEmailContent(tasks) {
     });
     return `${label}\n${lines.join('\n')}`;
   };
-  const textParts = sections.map((s) => textSection(s.label, s.tasks)).filter(Boolean);
-
   const htmlSection = (label, list) => {
     if (list.length === 0) return '';
     const items = list
       .map((t) => {
         const daysLabel = formatDaysUntil(t.due) || formatDueDate(t.due);
         const dueHtml = daysLabel
-          ? ` <span style="color:#888;font-size:12px;">(${daysLabel})</span>`
+          ? ` <span style="color:#888;font-size:12px;">(${escapeHtml(daysLabel)})</span>`
           : '';
-        return `<li><a href="${t.url}" style="text-decoration:none;color:#111;">${t.title}</a>${dueHtml}</li>`;
+        return `<li><a href="${escapeHtml(t.url)}" style="text-decoration:none;color:#111;">${escapeHtml(t.title)}</a>${dueHtml}</li>`;
       })
       .join('\n');
     return `
-      <h3 style="margin-bottom:4px;">${label}</h3>
+      <h3 style="margin-bottom:4px;">${escapeHtml(label)}</h3>
       <ul style="line-height:1.8;margin-top:0;">${items}</ul>
     `;
   };
-  const htmlParts = sections.map((s) => htmlSection(s.label, s.tasks)).filter(Boolean);
+
+  const textParts = [];
+  const htmlParts = [];
+  if (tasks.length === 0) {
+    textParts.push('Aucune tâche à faire pour le moment.');
+    htmlParts.push('<p>Aucune tâche à faire pour le moment.</p>');
+  } else {
+    textParts.push(`Tâches à faire:\n\n${sections.map((s) => textSection(s.label, s.tasks)).filter(Boolean).join('\n\n')}`);
+    htmlParts.push(`<h2>TÂCHES À FAIRE</h2>\n${sections.map((s) => htmlSection(s.label, s.tasks)).filter(Boolean).join('\n')}`);
+  }
+
+  // --- Calendrier du jour ---
+  const calendarItems = calendar.items || [];
+  const calendarNotes = calendar.notes || [];
+  if (calendarItems.length > 0 || calendarNotes.length > 0) {
+    const whenOf = (item) =>
+      item.allDay ? 'Toute la journée' : item.continued ? `jusqu'à ${formatClock(item.endsAt, tz)}` : formatClock(item.start, tz);
+    textParts.push(
+      [
+        'CALENDRIER',
+        ...calendarItems.map((i) => `${whenOf(i)} - ${i.title} (${i.source})`),
+        ...calendarNotes.map((n) => `⚠️ ${n}`),
+      ].join('\n')
+    );
+    const lis = calendarItems
+      .map((i) => {
+        const title = i.url
+          ? `<a href="${escapeHtml(i.url)}" style="text-decoration:none;color:#111;">${escapeHtml(i.title)}</a>`
+          : escapeHtml(i.title);
+        return `<li>${escapeHtml(whenOf(i))} - ${title} <span style="color:#888;font-size:12px;">(${escapeHtml(i.source)})</span></li>`;
+      })
+      .join('\n');
+    const notesHtml = calendarNotes
+      .map((n) => `<p style="color:#888;font-size:12px;margin:4px 0;">⚠️ ${escapeHtml(n)}</p>`)
+      .join('\n');
+    htmlParts.push(`<h2>CALENDRIER</h2>\n${lis ? `<ul style="line-height:1.8;margin-top:0;">${lis}</ul>` : ''}\n${notesHtml}`);
+  }
 
   return {
     subject: `Tâches à faire — ${dateStr}`,
-    text: `Tâches à faire:\n\n${textParts.join('\n\n')}`,
+    text: textParts.join('\n\n'),
     html: `
       <div style="font-family:sans-serif;max-width:600px;margin:0 auto;">
-        <h2>TÂCHES À FAIRE</h2>
         ${htmlParts.join('\n')}
       </div>
     `,
@@ -986,8 +1272,11 @@ async function fetchSentMessageId(resendEmailId) {
 
 async function deliverTasksEmail({ onlyIfChanged = false } = {}) {
   await getSettings(); // fuseau à jour pour les dates du courriel
-  const tasks = await fetchViewTasks();
-  const { subject, text, html } = buildEmailContent(tasks);
+  const allTasks = await fetchViewTasks();
+  const calendar = await fetchCalendar(dayBounds(new Date(), currentTimezone()));
+  // Un élément Notion qui a une heure aujourd'hui est au calendrier: pas répété dans les tâches.
+  const tasks = allTasks.filter((t) => !calendar.notionPageIds.has(t.id));
+  const { subject, text, html } = buildEmailContent(tasks, calendar);
 
   // Nouvelle journée (dans le fuseau choisi): nouvelle conversation.
   const dayKey = dateInZone(new Date(), currentTimezone());
@@ -1199,6 +1488,7 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  dayBounds,
   sendTasksEmail,
   verifyNotionWebhook,
   taskLink,
