@@ -83,6 +83,11 @@ const {
   // Chaque agenda doit être partagé avec le compte de service.
   GOOGLE_SERVICE_ACCOUNT_JSON,
   GOOGLE_CALENDAR_IDS,
+  // Autres bases Notion à lire comme calendriers, séparées par des virgules.
+  // Chaque entrée: l'identifiant ou le lien de la base, avec un nom facultatif
+  // avant le "=" ("Spectacles=<lien>") et une colonne date facultative après
+  // un "|" ("<lien>|Date du spectacle"). Sans colonne indiquée, l'app la trouve.
+  NOTION_EXTRA_CALENDARS,
 
   // Valeurs PAR DÉFAUT de l'envoi quotidien. Elles servent quand la base
   // Réglages n'est pas configurée ou est illisible.
@@ -1002,6 +1007,157 @@ async function fetchNotionCalendarItems(bounds) {
   return { items, pageIds };
 }
 
+// --- Autres bases Notion lues comme calendriers ---
+// Identifiant d'une base à partir d'un identifiant brut (avec ou sans tirets) ou
+// d'un lien Notion: on prend le dernier identifiant de 32 caractères du chemin.
+function extractNotionId(raw) {
+  const text = String(raw || '').trim();
+  let path = text;
+  try {
+    path = new URL(text).pathname;
+  } catch {
+    /* pas un lien: on lit le texte tel quel */
+  }
+  const matches = [...path.matchAll(/([0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12})(?![0-9a-f])/gi)];
+  return matches.length ? matches[matches.length - 1][1].replace(/-/g, '').toLowerCase() : '';
+}
+
+// Entrées: "id", "lien", "Nom=id", "Nom=lien", chacune avec "|Colonne date" facultatif.
+function parseExtraCalendars(raw) {
+  const calendars = [];
+  for (const entry of String(raw || '').split(',').map((e) => e.trim()).filter(Boolean)) {
+    let rest = entry;
+    let name = '';
+    const eq = rest.indexOf('=');
+    // Le nom précède le premier "=", sauf si ce "=" fait partie d'un lien (?v=...).
+    if (eq >= 0 && !/[/:]/.test(rest.slice(0, eq))) {
+      name = rest.slice(0, eq).trim();
+      rest = rest.slice(eq + 1).trim();
+    }
+    let dateProperty = '';
+    const bar = rest.lastIndexOf('|');
+    if (bar >= 0) {
+      dateProperty = rest.slice(bar + 1).trim();
+      rest = rest.slice(0, bar).trim();
+    }
+    const id = extractNotionId(rest);
+    if (!id) {
+      console.warn(`⚠️ NOTION_EXTRA_CALENDARS: entrée ignorée, aucun identifiant de base reconnu ("${entry.slice(0, 60)}").`);
+      continue;
+    }
+    calendars.push({ name, id, dateProperty });
+  }
+  return calendars;
+}
+const notionExtraCalendars = parseExtraCalendars(NOTION_EXTRA_CALENDARS);
+
+// Titre et colonnes de type date d'une base (gardés en mémoire 10 min).
+const notionDatabaseInfoCache = new Map();
+async function getNotionDatabaseInfo(id) {
+  const cached = notionDatabaseInfoCache.get(id);
+  if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.info;
+  const res = await fetch(`https://api.notion.com/v1/databases/${id}`, {
+    headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Notion a répondu ${res.status} pour la base ${id.slice(0, 8)}… (vérifie qu'elle est connectée à l'intégration, et que c'est bien l'identifiant de la base): ${await res.text()}`
+    );
+  }
+  const db = await res.json();
+  const info = {
+    title: (db.title || []).map((t) => t.plain_text).join('').trim(),
+    dateProps: Object.entries(db.properties || {}).filter(([, p]) => p.type === 'date').map(([name]) => name),
+  };
+  notionDatabaseInfoCache.set(id, { at: Date.now(), info });
+  return info;
+}
+
+const loggedDateChoices = new Set();
+function pickDateProperty(calendar, info) {
+  if (calendar.dateProperty) {
+    const found = info.dateProps.find((n) => titleKey(n) === titleKey(calendar.dateProperty));
+    if (!found) {
+      throw new Error(`colonne date "${calendar.dateProperty}" introuvable (colonnes de type date: ${info.dateProps.join(', ') || 'aucune'})`);
+    }
+    return found;
+  }
+  if (info.dateProps.length === 0) throw new Error('cette base n\'a aucune colonne de type date');
+  const chosen = info.dateProps.find((n) => ['dates', 'date'].includes(titleKey(n))) || info.dateProps[0];
+  if (info.dateProps.length > 1 && !loggedDateChoices.has(calendar.id)) {
+    loggedDateChoices.add(calendar.id);
+    console.log(`ℹ️ Base Notion ${calendar.id.slice(0, 8)}…: colonne date "${chosen}" utilisée (colonnes de type date: ${info.dateProps.join(', ')}). Pour en choisir une autre, ajoute |NomDeLaColonne.`);
+  }
+  return chosen;
+}
+
+const shiftDateString = (dateStr, days) => {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+};
+
+// Une date Notion (jour seul ou avec heure, avec ou sans fin) en événement du jour.
+function notionDateToItem(date, bounds, label, page) {
+  if (!date?.start) return null;
+  const title = extractTitle(page);
+
+  if (!/T\d{2}:\d{2}/.test(date.start)) {
+    const startDay = date.start.slice(0, 10);
+    const endDay = (date.end || date.start).slice(0, 10);
+    if (!(startDay <= bounds.dateStr && bounds.dateStr <= endDay)) return null;
+    return { source: label, title, url: page.url, allDay: true, start: bounds.start };
+  }
+
+  const timeZone = date.time_zone || currentTimezone();
+  const start = parseNotionDateTime(date.start, timeZone);
+  if (!start) return null;
+  const end = date.end && /T\d{2}:\d{2}/.test(date.end) ? parseNotionDateTime(date.end, timeZone) || start : start;
+  if (start >= bounds.end) return null;
+  if (end > start ? end <= bounds.start : end < bounds.start) return null;
+  const continued = start < bounds.start;
+  return { source: label, title, url: page.url, allDay: false, start: continued ? bounds.start : start, endsAt: end, continued };
+}
+
+// Événements d'aujourd'hui d'une autre base Notion (avec heure, ou toute la journée).
+async function fetchExtraNotionCalendarItems(calendar, bounds) {
+  const info = await getNotionDatabaseInfo(calendar.id);
+  const dateProperty = pickDateProperty(calendar, info);
+  const label = calendar.name ? `Notion ${calendar.name}` : info.title ? `Notion ${info.title}` : 'Notion';
+  const items = [];
+
+  let cursor;
+  for (let i = 0; i < 5; i++) {
+    const res = await fetch(`https://api.notion.com/v1/databases/${calendar.id}/query`, {
+      method: 'POST',
+      headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
+      body: JSON.stringify({
+        page_size: 100,
+        // Fenêtre large (14 jours avant, 1 jour après): le tri exact se fait ensuite
+        // ici, ce qui évite les erreurs d'un jour liées aux fuseaux et garde les
+        // événements de plusieurs jours qui ont commencé avant aujourd'hui.
+        filter: {
+          and: [
+            { property: dateProperty, date: { on_or_after: shiftDateString(bounds.dateStr, -14) } },
+            { property: dateProperty, date: { on_or_before: shiftDateString(bounds.dateStr, 1) } },
+          ],
+        },
+        ...(cursor ? { start_cursor: cursor } : {}),
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error(`Notion a répondu ${res.status} pour la base ${calendar.id.slice(0, 8)}…: ${await res.text()}`);
+    const data = await res.json();
+    for (const page of data.results || []) {
+      const item = notionDateToItem(findProperty(page.properties, dateProperty)?.date, bounds, label, page);
+      if (item) items.push(item);
+    }
+    if (!data.has_more || !data.next_cursor) break;
+    cursor = data.next_cursor;
+  }
+  return items;
+}
+
 // --- Google Agenda (compte de service, sans bibliothèque externe) ---
 function loadGoogleCredentials() {
   const raw = (GOOGLE_SERVICE_ACCOUNT_JSON || '').trim();
@@ -1148,6 +1304,16 @@ async function fetchCalendar(bounds) {
   } catch (err) {
     console.error(`⚠️ Calendrier Notion illisible: ${err.message}`);
     calendar.notes.push('Calendrier Notion indisponible');
+  }
+
+  for (const extra of notionExtraCalendars) {
+    try {
+      calendar.items.push(...(await fetchExtraNotionCalendarItems(extra, bounds)));
+    } catch (err) {
+      const shown = extra.name || extra.id.slice(0, 8);
+      console.error(`⚠️ Calendrier Notion « ${shown} » illisible: ${err.message}`);
+      calendar.notes.push(`Calendrier Notion « ${shown} » indisponible`);
+    }
   }
 
   if (googleCredentials && googleCalendars.length > 0) {
