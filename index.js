@@ -66,8 +66,8 @@ const {
   // NOTION_WEBHOOK_SECRET: jeton de vérification fourni par Notion. Sans lui,
   // la fonction est inactive.
   NOTION_WEBHOOK_SECRET,
-  // Colonne qui marque une tâche comme faite: vraie case à cocher, ou statut
-  // (affiché ou non comme une case; "terminé" = groupe Complete du statut).
+  // Colonne "Todo" (case ou statut): son changement, dans un sens ou l'autre,
+  // déclenche aussi un courriel de mise à jour.
   NOTION_DONE_PROPERTY = 'Todo',
   // Délai (secondes) avant l'envoi, remis à zéro à chaque nouvelle case cochée:
   // cocher plusieurs tâches d'affilée ne donne qu'un seul courriel.
@@ -460,8 +460,29 @@ const CHECK_EMAIL_DELAY_MS =
     ? checkDelaySeconds
     : 15) * 1000;
 
-// Envoie le courriel de mise à jour après un court délai, remis à zéro à chaque
-// nouvelle case cochée.
+// Colonnes dont la modification déclenche un courriel de mise à jour: le titre
+// de la tâche, ses dates, sa priorité et son état (case ou statut).
+const WATCHED_PROPERTY_NAMES = [
+  NOTION_TITLE_PROPERTY,
+  NOTION_TASK_DATE_PROPERTY,
+  NOTION_DUE_DATE_PROPERTY,
+  NOTION_PRIORITY_PROPERTY,
+  NOTION_DONE_PROPERTY,
+];
+
+function resolveWatchedProperty(properties, name) {
+  const found = findProperty(properties, name);
+  if (found) return found;
+  // Le titre peut porter un autre nom que prévu: on prend la colonne de type titre.
+  if (normalizeName(name) === normalizeName(NOTION_TITLE_PROPERTY)) {
+    return Object.values(properties || {}).find((p) => p.type === 'title');
+  }
+  return undefined;
+}
+
+// Envoie la dernière version de la liste après un court délai, remis à zéro à
+// chaque nouvelle modification: plusieurs modifications d'affilée ne donnent
+// qu'un seul courriel.
 let checkEmailTimer = null;
 function scheduleCheckUpdateEmail() {
   clearTimeout(checkEmailTimer);
@@ -473,68 +494,18 @@ function scheduleCheckUpdateEmail() {
         console.log('↪ Mise à jour non envoyée: envoi suspendu dans Réglages.');
         return;
       }
-      const count = await sendTasksEmail();
-      console.log(`✅ Courriel de mise à jour envoyé (${count} tâche(s)).`);
+      // Seulement si la liste est différente du dernier courriel du jour:
+      // modifier une tâche hors de la vue ne produit pas de courriel identique.
+      const count = await sendTasksEmail({ onlyIfChanged: true });
+      if (count !== null) console.log(`✅ Courriel de mise à jour envoyé (${count} tâche(s)).`);
     } catch (err) {
-      console.error('Erreur lors de la mise à jour après case cochée:', err);
+      console.error('Erreur lors de la mise à jour après modification:', err);
     }
   }, CHECK_EMAIL_DELAY_MS);
 }
 
-// Noms de statut considérés comme "terminé" (accents et majuscules ignorés).
-const DONE_NAME_PATTERN = /^(done|complete|completed|finished|termine|terminee|fait|faite|fini|finie)\b/;
-const isDoneName = (name) => DONE_NAME_PATTERN.test(titleKey(name));
-
-// Un statut Notion est rangé en 3 groupes (À faire / En cours / Terminé). Une
-// case "cochée" correspond à une option du groupe Terminé: on lit ce groupe
-// dans la base (gardé en mémoire 10 min).
-let doneOptionsCache = { at: 0, ids: null };
-async function getDoneStatusOptionIds() {
-  if (!NOTION_DATABASE_ID) return null;
-  if (doneOptionsCache.ids && Date.now() - doneOptionsCache.at < 10 * 60 * 1000) {
-    return doneOptionsCache.ids;
-  }
-  try {
-    const res = await fetch(`https://api.notion.com/v1/databases/${NOTION_DATABASE_ID}`, {
-      headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
-    });
-    if (!res.ok) throw new Error(`Notion a répondu ${res.status}`);
-    const db = await res.json();
-    const prop = findProperty(db.properties, NOTION_DONE_PROPERTY);
-    const groups = prop?.type === 'status' ? prop.status?.groups || [] : [];
-    // Le groupe "Terminé" est reconnu par son nom, sinon c'est le dernier.
-    const group = groups.find((g) => isDoneName(g.name)) || groups[groups.length - 1];
-    const ids = new Set(group?.option_ids || []);
-    if (ids.size === 0) return null;
-    doneOptionsCache = { at: Date.now(), ids };
-    return ids;
-  } catch (err) {
-    console.warn(`⚠️ Groupes du statut "${NOTION_DONE_PROPERTY}" illisibles (${err.message}): le nom du statut est utilisé à la place.`);
-    return null;
-  }
-}
-
-// Dit si la colonne indique "terminé", et décrit sa valeur pour les logs.
-// Renvoie null si le type de colonne n'est pas géré.
-async function readDoneState(prop) {
-  if (prop.type === 'checkbox') {
-    return { done: prop.checkbox === true, label: prop.checkbox ? 'case cochée' : 'case décochée' };
-  }
-  if (prop.type === 'status') {
-    const name = prop.status?.name || '';
-    const ids = await getDoneStatusOptionIds();
-    const done = ids ? ids.has(prop.status?.id) : isDoneName(name);
-    return { done, label: `statut "${name}"` };
-  }
-  if (prop.type === 'select') {
-    const name = prop.select?.name || '';
-    return { done: isDoneName(name), label: `choix "${name}"` };
-  }
-  return null;
-}
-
-// Décide si un événement "page.properties_updated" correspond à une tâche qu'on
-// vient de TERMINER dans la bonne base. Journalise la raison de chaque rejet.
+// Décide si un événement "page.properties_updated" concerne une colonne suivie
+// d'une tâche de la base Todo. Journalise la raison de chaque rejet.
 async function handleNotionEvent(event) {
   if (event.type !== 'page.properties_updated') {
     console.log(`↪ Événement Notion ignoré: type "${event.type}" (seul page.properties_updated est utilisé).`);
@@ -563,27 +534,18 @@ async function handleNotionEvent(event) {
     return;
   }
 
-  const prop = findProperty(page.properties, NOTION_DONE_PROPERTY);
-  if (!prop) {
-    console.warn(`↪ Événement Notion ignoré: colonne "${NOTION_DONE_PROPERTY}" introuvable.`);
-    return;
+  const updatedIds = new Set(updated.map(safeDecode));
+  const changed = [];
+  for (const name of new Set(WATCHED_PROPERTY_NAMES)) {
+    const prop = resolveWatchedProperty(page.properties, name);
+    if (prop && updatedIds.has(safeDecode(prop.id))) changed.push(name);
   }
-  if (!updated.map(safeDecode).includes(safeDecode(prop.id))) {
-    console.log(`↪ Événement Notion ignoré: la colonne "${NOTION_DONE_PROPERTY}" n'a pas changé.`);
-    return;
-  }
-
-  const state = await readDoneState(prop);
-  if (!state) {
-    console.warn(`↪ Événement Notion ignoré: la colonne "${NOTION_DONE_PROPERTY}" est de type "${prop.type}" (gérés: case à cocher, statut, choix).`);
-    return;
-  }
-  if (!state.done) {
-    console.log(`↪ Événement Notion ignoré: "${NOTION_DONE_PROPERTY}" n'est pas terminée (${state.label}).`);
+  if (changed.length === 0) {
+    console.log(`↪ Événement Notion ignoré: aucune colonne suivie n'a changé (suivies: ${[...new Set(WATCHED_PROPERTY_NAMES)].join(', ')}).`);
     return;
   }
 
-  console.log(`🔔 "${NOTION_DONE_PROPERTY}" terminée (${state.label}): mise à jour dans ${CHECK_EMAIL_DELAY_MS / 1000} s.`);
+  console.log(`🔔 Colonne(s) modifiée(s): ${changed.map((n) => `"${n}"`).join(', ')}. Mise à jour dans ${CHECK_EMAIL_DELAY_MS / 1000} s.`);
   scheduleCheckUpdateEmail();
 }
 
@@ -704,38 +666,6 @@ async function createNotionTaskFromEmail(subject, bodyContent) {
   const page = await res.json();
   console.log(`✅ Tâche créée dans Notion: "${title}" (${page.id})`);
   return page;
-}
-
-// Envoie un petit courriel de rappel demandant de compléter la nouvelle
-// tâche (échéance + priorité), avec un lien direct vers la page Notion.
-async function sendTaskCreatedReminder(title, pageUrl) {
-  const response = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${RESEND_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: MAIL_FROM || 'onboarding@resend.dev',
-      to: [MAIL_TO],
-      subject: `→ ${title}`,
-      text: `${title.toUpperCase()}\nDue Date (à ajouter)\nPriorité (à ajouter)\n\n${pageUrl}`,
-      html: `
-        <div style="font-family:sans-serif;max-width:600px;margin:0 auto;font-size:18px;">
-          <a href="${pageUrl}" style="text-decoration:underline;color:#111;display:block;">
-            <p style="font-weight:bold;margin-bottom:4px;">${title.toUpperCase()}</p>
-            <p style="margin:0;">Due Date (à ajouter)</p>
-            <p style="margin:0;">Priorité (à ajouter)</p>
-          </a>
-        </div>
-      `,
-    }),
-  });
-
-  if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Resend (reminder) a répondu ${response.status}: ${errorBody}`);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -964,7 +894,7 @@ function buildEmailContent(tasks) {
 
   if (tasks.length === 0) {
     return {
-      subject: `Aucune tâche en attente — ${dateStr}`,
+      subject: `Tâches à faire — ${dateStr}`,
       text: 'Aucune tâche à faire pour le moment.',
       html: '<p>Aucune tâche à faire pour le moment.</p>',
     };
@@ -1014,7 +944,7 @@ function buildEmailContent(tasks) {
   const htmlParts = sections.map((s) => htmlSection(s.label, s.tasks)).filter(Boolean);
 
   return {
-    subject: `${tasks.length} tâche(s) à faire — ${dateStr}`,
+    subject: `Tâches à faire — ${dateStr}`,
     text: `Tâches à faire:\n\n${textParts.join('\n\n')}`,
     html: `
       <div style="font-family:sans-serif;max-width:600px;margin:0 auto;">
@@ -1025,11 +955,52 @@ function buildEmailContent(tasks) {
   };
 }
 
-async function sendTasksEmail() {
+// ---------------------------------------------------------------------------
+// Conversation du jour: le résumé du matin et les mises à jour d'une même
+// journée sont regroupés dans une seule conversation. Ils ont le même objet,
+// et chaque envoi suivant cite le premier (en-têtes In-Reply-To et References),
+// dont on lit l'identifiant de message auprès de Resend.
+// ---------------------------------------------------------------------------
+const dailyThread = { key: '', messageId: '', lastText: '', warned: false };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function fetchSentMessageId(resendEmailId) {
+  if (!resendEmailId) return '';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(`https://api.resend.com/emails/${resendEmailId}`, {
+        headers: { Authorization: `Bearer ${RESEND_API_KEY}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const raw = String(data.message_id || data.messageId || '').trim();
+        if (raw) return /^<.*>$/.test(raw) ? raw : `<${raw}>`;
+      }
+    } catch {
+      /* on réessaie */
+    }
+    if (attempt < 3) await sleep(400 * attempt);
+  }
+  return '';
+}
+
+async function deliverTasksEmail({ onlyIfChanged = false } = {}) {
   await getSettings(); // fuseau à jour pour les dates du courriel
   const tasks = await fetchViewTasks();
   const { subject, text, html } = buildEmailContent(tasks);
 
+  // Nouvelle journée (dans le fuseau choisi): nouvelle conversation.
+  const dayKey = dateInZone(new Date(), currentTimezone());
+  if (dailyThread.key !== dayKey) {
+    Object.assign(dailyThread, { key: dayKey, messageId: '', lastText: '', warned: false });
+  }
+
+  if (onlyIfChanged && dailyThread.lastText === text) {
+    console.log('↪ Liste inchangée depuis le dernier courriel: aucune mise à jour envoyée.');
+    return null;
+  }
+
+  const threaded = Boolean(dailyThread.messageId);
   const response = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
@@ -1042,6 +1013,9 @@ async function sendTasksEmail() {
       subject,
       text,
       html,
+      ...(threaded
+        ? { headers: { 'In-Reply-To': dailyThread.messageId, References: dailyThread.messageId } }
+        : {}),
     }),
   });
 
@@ -1049,9 +1023,32 @@ async function sendTasksEmail() {
     const errorBody = await response.text();
     throw new Error(`Resend a répondu ${response.status}: ${errorBody}`);
   }
+  dailyThread.lastText = text;
 
-  console.log(`✅ Courriel envoyé (${tasks.length} tâche(s)) à ${MAIL_TO}`);
+  // Premier courriel de la journée: on garde son identifiant de message pour
+  // que les suivants s'y rattachent.
+  if (!threaded) {
+    const sent = await response.json().catch(() => ({}));
+    const messageId = await fetchSentMessageId(sent.id);
+    if (messageId) {
+      dailyThread.messageId = messageId;
+    } else if (!dailyThread.warned) {
+      dailyThread.warned = true;
+      console.warn("⚠️ Identifiant du courriel introuvable chez Resend: les courriels de la journée ne seront pas regroupés (la clé Resend doit avoir l'accès complet).");
+    }
+  }
+
+  console.log(`✅ Courriel envoyé (${tasks.length} tâche(s)) à ${MAIL_TO}${threaded ? ' [même conversation]' : ''}`);
   return tasks.length;
+}
+
+// Les envois se font l'un après l'autre, pour que le premier courriel du jour
+// soit enregistré avant que le suivant parte.
+let sendLock = Promise.resolve();
+function sendTasksEmail(options = {}) {
+  const run = sendLock.then(() => deliverTasksEmail(options));
+  sendLock = run.catch(() => {});
+  return run;
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,9 +1095,11 @@ app.post('/inbound-email', express.raw({ type: 'application/json' }), async (req
   try {
     const subject = event.data?.subject;
     const bodyContent = await fetchInboundEmailContent(event.data?.email_id);
-    const page = await createNotionTaskFromEmail(subject, bodyContent);
-    await sendTaskCreatedReminder((subject || '(sans sujet)').trim(), taskLink(page));
-    console.log('✅ Courriel de rappel envoyé.');
+    await createNotionTaskFromEmail(subject, bodyContent);
+    // La nouvelle tâche (sans priorité) apparaît dans la liste sous "Non classé":
+    // c'est la mise à jour de la liste qui sert de rappel.
+    console.log(`🔔 Tâche créée par courriel: mise à jour de la liste dans ${CHECK_EMAIL_DELAY_MS / 1000} s.`);
+    scheduleCheckUpdateEmail();
   } catch (err) {
     console.error('Erreur lors de la création de la tâche depuis le courriel:', err);
   }
@@ -1200,6 +1199,7 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  sendTasksEmail,
   verifyNotionWebhook,
   taskLink,
   parseSendTime,
