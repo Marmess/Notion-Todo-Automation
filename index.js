@@ -15,8 +15,10 @@ const {
   NOTION_TITLE_PROPERTY = 'Name',
   // Nom de la propriété "Priorité" (type Select) dans Notion
   NOTION_PRIORITY_PROPERTY = 'Priorité',
-  // Valeur exacte qui indique qu'une tâche est prioritaire
-  NOTION_PRIORITY_VALUE = 'Prioritaire',
+  // Niveaux de priorité (valeurs exactes de la colonne Select dans Notion),
+  // séparés par des virgules, dans l'ordre d'affichage dans le courriel.
+  // Les tâches sans priorité s'affichent d'abord sous "Non classé".
+  NOTION_PRIORITY_ORDER = 'Urgent,Cette semaine,Non prioritaire',
   // Nom exact de la colonne date d'échéance dans Notion (pour le compte
   // à rebours affiché dans le courriel quotidien)
   NOTION_DUE_DATE_PROPERTY = 'Due Date',
@@ -231,11 +233,12 @@ function extractTitle(page) {
   return prop.title.map((t) => t.plain_text).join('') || '(sans titre)';
 }
 
-// Retourne 'priority', 'regular' ou 'unclassified' selon la valeur de la colonne Priorité
-function extractPriorityStatus(page) {
+// Retourne le nom exact de la priorité choisie dans la colonne Select
+// (ex: 'Urgent'), ou une chaîne vide si aucune priorité n'est définie.
+function extractPriorityLabel(page) {
   const prop = page.properties?.[NOTION_PRIORITY_PROPERTY];
-  if (!prop || prop.type !== 'select' || !prop.select) return 'unclassified';
-  return prop.select.name === NOTION_PRIORITY_VALUE ? 'priority' : 'regular';
+  if (!prop || prop.type !== 'select' || !prop.select) return '';
+  return prop.select.name || '';
 }
 
 function extractDueDate(page) {
@@ -374,7 +377,7 @@ async function fetchViewTasks() {
     title: extractTitle(page),
     url: page.url,
     due: extractDueDate(page),
-    priorityStatus: extractPriorityStatus(page),
+    priorityLabel: extractPriorityLabel(page),
   }));
 }
 
@@ -398,9 +401,20 @@ function buildEmailContent(tasks) {
     };
   }
 
-  const unclassifiedTasks = tasks.filter((t) => t.priorityStatus === 'unclassified');
-  const priorityTasks = tasks.filter((t) => t.priorityStatus === 'priority');
-  const regularTasks = tasks.filter((t) => t.priorityStatus === 'regular');
+  // Ordre des sections: "Non classé" d'abord, puis chaque niveau configuré,
+  // puis (par sécurité) toute valeur inattendue rencontrée — ainsi aucune
+  // tâche ne disparaît du courriel si une valeur n'est pas dans la liste.
+  const configuredLevels = NOTION_PRIORITY_ORDER.split(',').map((s) => s.trim()).filter(Boolean);
+  const unexpectedLevels = [...new Set(tasks.map((t) => t.priorityLabel))].filter(
+    (label) => label && !configuredLevels.includes(label)
+  );
+  const sections = [
+    { label: 'Non classé', tasks: tasks.filter((t) => !t.priorityLabel) },
+    ...[...configuredLevels, ...unexpectedLevels].map((label) => ({
+      label,
+      tasks: tasks.filter((t) => t.priorityLabel === label),
+    })),
+  ];
 
   const textSection = (label, list) => {
     if (list.length === 0) return '';
@@ -410,11 +424,7 @@ function buildEmailContent(tasks) {
     });
     return `${label}\n${lines.join('\n')}`;
   };
-  const textParts = [
-    textSection('Non classé', unclassifiedTasks),
-    textSection('Prioritaire', priorityTasks),
-    textSection('Non prioritaire', regularTasks),
-  ].filter(Boolean);
+  const textParts = sections.map((s) => textSection(s.label, s.tasks)).filter(Boolean);
 
   const htmlSection = (label, list) => {
     if (list.length === 0) return '';
@@ -432,11 +442,7 @@ function buildEmailContent(tasks) {
       <ul style="line-height:1.8;margin-top:0;">${items}</ul>
     `;
   };
-  const htmlParts = [
-    htmlSection('Non classé', unclassifiedTasks),
-    htmlSection('Prioritaire', priorityTasks),
-    htmlSection('Non prioritaire', regularTasks),
-  ].filter(Boolean);
+  const htmlParts = sections.map((s) => htmlSection(s.label, s.tasks)).filter(Boolean);
 
   return {
     subject: `${tasks.length} tâche(s) à faire — ${dateStr}`,
