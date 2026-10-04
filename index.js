@@ -62,6 +62,16 @@ const {
   // 's' = panneau latéral, 'c' = fenêtre centrée
   TASK_LINK_PEEK = 's',
 
+  // Courriel de mise à jour quand tu coches une tâche (webhooks Notion).
+  // NOTION_WEBHOOK_SECRET: jeton de vérification fourni par Notion. Sans lui,
+  // la fonction est inactive.
+  NOTION_WEBHOOK_SECRET,
+  // Colonne case à cocher qui marque une tâche comme faite.
+  NOTION_DONE_CHECKBOX_PROPERTY = 'Todo',
+  // Délai (secondes) avant l'envoi, remis à zéro à chaque nouvelle case cochée:
+  // cocher plusieurs tâches d'affilée ne donne qu'un seul courriel.
+  CHECK_EMAIL_DELAY_SECONDS = '15',
+
   // Valeurs PAR DÉFAUT de l'envoi quotidien. Elles servent quand la base
   // Réglages n'est pas configurée ou est illisible.
   // CRON_SCHEDULE: seule l'heure compte (ex: '0 7 * * *' = 07:00).
@@ -399,6 +409,102 @@ async function schedulerTick() {
   } catch (err) {
     console.error('Erreur cron:', err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks Notion: courriel de mise à jour quand une case "Todo" est cochée
+// ---------------------------------------------------------------------------
+// Signature: en-tête X-Notion-Signature = "sha256=" + HMAC-SHA256 du corps brut,
+// avec le jeton de vérification comme clé.
+function verifyNotionWebhook(rawBody, signature) {
+  if (!NOTION_WEBHOOK_SECRET || !signature) return false;
+  const expected = Buffer.from(
+    'sha256=' + crypto.createHmac('sha256', NOTION_WEBHOOK_SECRET).update(rawBody).digest('hex')
+  );
+  const received = Buffer.from(String(signature));
+  return expected.length === received.length && crypto.timingSafeEqual(expected, received);
+}
+
+const safeDecode = (s) => {
+  try {
+    return decodeURIComponent(String(s));
+  } catch {
+    return String(s);
+  }
+};
+const sameNotionId = (a, b) =>
+  String(a || '').replace(/-/g, '').toLowerCase() === String(b || '').replace(/-/g, '').toLowerCase();
+
+const checkDelaySeconds = Number(CHECK_EMAIL_DELAY_SECONDS);
+const CHECK_EMAIL_DELAY_MS =
+  (Number.isFinite(checkDelaySeconds) && checkDelaySeconds >= 0 && checkDelaySeconds <= 600
+    ? checkDelaySeconds
+    : 15) * 1000;
+
+// Envoie le courriel de mise à jour après un court délai, remis à zéro à chaque
+// nouvelle case cochée.
+let checkEmailTimer = null;
+function scheduleCheckUpdateEmail() {
+  clearTimeout(checkEmailTimer);
+  checkEmailTimer = setTimeout(async () => {
+    checkEmailTimer = null;
+    try {
+      const settings = await getSettings();
+      if (!settings.active) {
+        console.log('↪ Mise à jour non envoyée: envoi suspendu dans Réglages.');
+        return;
+      }
+      const count = await sendTasksEmail();
+      console.log(`✅ Courriel de mise à jour envoyé (${count} tâche(s)).`);
+    } catch (err) {
+      console.error('Erreur lors de la mise à jour après case cochée:', err);
+    }
+  }, CHECK_EMAIL_DELAY_MS);
+}
+
+// Décide si un événement "page.properties_updated" correspond à une case Todo
+// qu'on vient de COCHER dans la bonne base. Journalise la raison de chaque rejet.
+async function handleNotionEvent(event) {
+  if (event.type !== 'page.properties_updated') return;
+
+  const pageId = event.entity?.id;
+  const updated = event.data?.updated_properties;
+  if (!pageId) return;
+  if (!Array.isArray(updated)) {
+    console.warn('↪ Événement Notion ignoré: pas de liste updated_properties.');
+    return;
+  }
+
+  const res = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+    headers: { ...NOTION_HEADERS, 'Notion-Version': '2022-06-28' },
+  });
+  if (!res.ok) {
+    console.warn(`↪ Événement Notion ignoré: page illisible (${res.status}).`);
+    return;
+  }
+  const page = await res.json();
+
+  if (NOTION_DATABASE_ID && !sameNotionId(page.parent?.database_id, NOTION_DATABASE_ID)) {
+    console.log('↪ Événement Notion ignoré: la page n\'est pas dans la base Todo.');
+    return;
+  }
+
+  const checkbox = findProperty(page.properties, NOTION_DONE_CHECKBOX_PROPERTY);
+  if (!checkbox || checkbox.type !== 'checkbox') {
+    console.warn(`↪ Événement Notion ignoré: colonne "${NOTION_DONE_CHECKBOX_PROPERTY}" (case à cocher) introuvable.`);
+    return;
+  }
+  if (!updated.map(safeDecode).includes(safeDecode(checkbox.id))) {
+    console.log(`↪ Événement Notion ignoré: la colonne "${NOTION_DONE_CHECKBOX_PROPERTY}" n'a pas changé.`);
+    return;
+  }
+  if (checkbox.checkbox !== true) {
+    console.log('↪ Événement Notion ignoré: case décochée.');
+    return;
+  }
+
+  console.log(`🔔 Case "${NOTION_DONE_CHECKBOX_PROPERTY}" cochée: mise à jour dans ${CHECK_EMAIL_DELAY_MS / 1000} s.`);
+  scheduleCheckUpdateEmail();
 }
 
 // ---------------------------------------------------------------------------
@@ -920,6 +1026,43 @@ app.post('/inbound-email', express.raw({ type: 'application/json' }), async (req
   }
 });
 
+// Webhooks Notion. Le premier appel (création de l'abonnement) n'est pas signé et
+// contient le jeton de vérification, qu'on affiche dans les logs pour que tu le
+// colles dans Notion (bouton Verify) et dans NOTION_WEBHOOK_SECRET.
+app.post('/notion-webhook', express.raw({ type: () => true }), async (req, res) => {
+  const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from('');
+  const signature = req.headers['x-notion-signature'];
+
+  let event;
+  try {
+    event = JSON.parse(rawBody.toString('utf8'));
+  } catch {
+    return res.status(400).json({ error: 'JSON invalide' });
+  }
+
+  if (!signature && event.verification_token) {
+    console.log(`🔑 Jeton de vérification Notion reçu: ${event.verification_token}`);
+    console.log('   Colle-le dans Notion (bouton Verify) et dans la variable NOTION_WEBHOOK_SECRET.');
+    return res.status(200).json({ received: true });
+  }
+
+  if (!NOTION_WEBHOOK_SECRET) {
+    console.log('↪ Événement Notion ignoré: NOTION_WEBHOOK_SECRET n\'est pas défini.');
+    return res.status(200).json({ received: true });
+  }
+  if (!verifyNotionWebhook(rawBody, signature)) {
+    console.error('❌ Signature webhook Notion invalide, requête ignorée.');
+    return res.status(401).json({ error: 'Signature invalide' });
+  }
+
+  res.status(200).json({ received: true });
+  try {
+    await handleNotionEvent(event);
+  } catch (err) {
+    console.error('Erreur lors du traitement de l\'événement Notion:', err);
+  }
+});
+
 // Endpoint pour déclencher l'envoi manuellement
 app.post('/send-tasks', async (req, res) => {
   if (TRIGGER_SECRET) {
@@ -974,6 +1117,7 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  verifyNotionWebhook,
   taskLink,
   parseSendTime,
   defaultSendTime,
