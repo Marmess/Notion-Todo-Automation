@@ -51,6 +51,17 @@ const {
   // 120, minimum 5). Sous 60, chaque vérification d'une minute relit Notion.
   SETTINGS_REFRESH_SECONDS = '120',
 
+  // Liens des tâches dans les courriels. 'view' (défaut): la tâche s'ouvre
+  // par-dessus une vue Notion (NOTION_VIEW_ID, ou TASK_LINK_VIEW_ID si tu
+  // veux une autre vue). 'page': ouvre la page seule (ancien comportement).
+  TASK_LINK_MODE = 'view',
+  // Lien complet d'une vue Notion (copié avec "Copy link"). S'il est fourni,
+  // chaque tâche s'ouvre par-dessus CETTE vue: c'est le réglage le plus simple.
+  TASK_LINK_VIEW_URL,
+  TASK_LINK_VIEW_ID,
+  // 's' = panneau latéral, 'c' = fenêtre centrée
+  TASK_LINK_PEEK = 's',
+
   // Valeurs PAR DÉFAUT de l'envoi quotidien. Elles servent quand la base
   // Réglages n'est pas configurée ou est illisible.
   // CRON_SCHEDULE: seule l'heure compte (ex: '0 7 * * *' = 07:00).
@@ -544,6 +555,56 @@ async function sendTaskCreatedReminder(title, pageUrl) {
 // ---------------------------------------------------------------------------
 // Extraction du texte du titre / de la date d'échéance d'une page Notion
 // ---------------------------------------------------------------------------
+// Lien d'une tâche pour les courriels. En mode 'view', la tâche s'ouvre par-dessus
+// la vue choisie (plutôt que sur la page seule). Sans base ou sans identifiant
+// de page, on garde le lien de la page.
+// Lit un lien de vue Notion: garde l'adresse de base (avec son éventuel nom
+// d'espace de travail) et l'identifiant de vue (?v=), et ignore le reste
+// (source=copy_link, etc.). Renvoie null si le lien est inutilisable.
+function parseViewUrl(raw) {
+  const cleaned = String(raw || '').trim().replace(/^["']|["']$/g, '');
+  if (!cleaned) return null;
+  try {
+    const u = new URL(cleaned);
+    const viewId = (u.searchParams.get('v') || '').replace(/-/g, '');
+    if (!/^[0-9a-f]{32}$/i.test(viewId)) return null;
+    return { base: `${u.origin}${u.pathname}`, viewId };
+  } catch {
+    return null;
+  }
+}
+const customViewLink = parseViewUrl(TASK_LINK_VIEW_URL);
+if (TASK_LINK_VIEW_URL && !customViewLink) {
+  console.warn('⚠️ TASK_LINK_VIEW_URL est illisible (il doit être un lien Notion contenant ?v=...): le lien par défaut est utilisé.');
+}
+
+function taskLink(page) {
+  if (TASK_LINK_MODE !== 'view' || !page?.id) return page?.url;
+
+  // Lien de vue fourni: la tâche s'ouvre par-dessus cette vue.
+  if (customViewLink) {
+    const peek = TASK_LINK_PEEK === 'c' ? 'c' : 's';
+    return `${customViewLink.base}?v=${customViewLink.viewId}&p=${String(page.id).replace(/-/g, '')}&pm=${peek}`;
+  }
+
+  if (!NOTION_DATABASE_ID) return page.url;
+  const viewId = String(TASK_LINK_VIEW_ID || NOTION_VIEW_ID).replace(/-/g, '');
+  const peek = TASK_LINK_PEEK === 'c' ? 'c' : 's';
+
+  // On reprend le même type d'adresse que celle renvoyée par Notion pour la
+  // page (app.notion.com/p/... ou www.notion.so/...).
+  let prefix = 'https://www.notion.so/';
+  try {
+    const u = new URL(page.url);
+    prefix = u.pathname.startsWith('/p/') ? `${u.origin}/p/` : `${u.origin}/`;
+  } catch {
+    /* adresse illisible: on garde le préfixe par défaut */
+  }
+  const dbId = String(NOTION_DATABASE_ID).replace(/-/g, '');
+  const pageId = String(page.id).replace(/-/g, '');
+  return `${prefix}${dbId}?v=${viewId}&p=${pageId}&pm=${peek}`;
+}
+
 function extractTitle(page) {
   const props = page.properties || {};
   // Cherche la propriété configurée, sinon la première propriété de type "title"
@@ -697,7 +758,7 @@ async function fetchViewTasks() {
 
   return fullPages.map((page) => ({
     title: extractTitle(page),
-    url: page.url,
+    url: taskLink(page),
     due: extractDueDate(page),
     priorityLabel: extractPriorityLabel(page),
   }));
@@ -852,7 +913,7 @@ app.post('/inbound-email', express.raw({ type: 'application/json' }), async (req
     const subject = event.data?.subject;
     const bodyContent = await fetchInboundEmailContent(event.data?.email_id);
     const page = await createNotionTaskFromEmail(subject, bodyContent);
-    await sendTaskCreatedReminder((subject || '(sans sujet)').trim(), page.url);
+    await sendTaskCreatedReminder((subject || '(sans sujet)').trim(), taskLink(page));
     console.log('✅ Courriel de rappel envoyé.');
   } catch (err) {
     console.error('Erreur lors de la création de la tâche depuis le courriel:', err);
@@ -912,6 +973,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+  app,
+  taskLink,
   parseSendTime,
   defaultSendTime,
   parseSettingsPage,
