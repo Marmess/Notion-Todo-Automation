@@ -77,8 +77,10 @@ const {
   // (colonne Dates avec une heure) et de Google Agenda.
   CALENDAR_ENABLED = 'true',
   // Clé JSON d'un compte de service Google (contenu du fichier, ou ce contenu
-  // encodé en base64) et agendas à lire (adresses ou identifiants séparés par
-  // des virgules). Chaque agenda doit être partagé avec le compte de service.
+  // encodé en base64) et agendas à lire, séparés par des virgules. Chaque
+  // entrée est un identifiant d'agenda, avec un nom facultatif qui s'affiche
+  // dans le courriel: "RV=martin@exemple.com,Famille=abc@group.calendar.google.com".
+  // Chaque agenda doit être partagé avec le compte de service.
   GOOGLE_SERVICE_ACCOUNT_JSON,
   GOOGLE_CALENDAR_IDS,
 
@@ -1015,8 +1017,17 @@ function loadGoogleCredentials() {
   }
 }
 const googleCredentials = loadGoogleCredentials();
-const googleCalendarIds = (GOOGLE_CALENDAR_IDS || '').split(',').map((id) => id.trim()).filter(Boolean);
-if (googleCredentials && googleCalendarIds.length === 0) {
+// Chaque entrée: "identifiant" ou "Nom=identifiant" (un identifiant ne contient jamais "=").
+const googleCalendars = (GOOGLE_CALENDAR_IDS || '')
+  .split(',')
+  .map((entry) => entry.trim())
+  .filter(Boolean)
+  .map((entry) => {
+    const eq = entry.indexOf('=');
+    return eq >= 0 ? { name: entry.slice(0, eq).trim(), id: entry.slice(eq + 1).trim() } : { name: '', id: entry };
+  })
+  .filter((calendar) => calendar.id);
+if (googleCredentials && googleCalendars.length === 0) {
   console.warn('⚠️ GOOGLE_CALENDAR_IDS est vide: Google Agenda est ignoré (indique les adresses des agendas à lire).');
 }
 
@@ -1063,7 +1074,7 @@ async function googleGet(url) {
   }
 }
 
-function googleEventToItem(ev, bounds) {
+function googleEventToItem(ev, bounds, label) {
   if (ev.status === 'cancelled') return null;
   if ((ev.attendees || []).some((a) => a.self && a.responseStatus === 'declined')) return null;
   const title = ev.summary || '(sans titre)';
@@ -1073,7 +1084,7 @@ function googleEventToItem(ev, bounds) {
   if (ev.start?.date) {
     const endDate = ev.end?.date || ev.start.date;
     if (!(ev.start.date <= bounds.dateStr && bounds.dateStr < endDate)) return null;
-    return { source: 'Google', title, url: ev.htmlLink, allDay: true, start: bounds.start };
+    return { source: label, title, url: ev.htmlLink, allDay: true, start: bounds.start };
   }
 
   if (!ev.start?.dateTime) return null;
@@ -1081,15 +1092,23 @@ function googleEventToItem(ev, bounds) {
   const end = ev.end?.dateTime ? new Date(ev.end.dateTime) : start;
   if (end <= bounds.start || start >= bounds.end) return null;
   const continued = start < bounds.start; // commencé hier, se poursuit aujourd'hui
-  return { source: 'Google', title, url: ev.htmlLink, allDay: false, start: continued ? bounds.start : start, endsAt: end, continued };
+  return { source: label, title, url: ev.htmlLink, allDay: false, start: continued ? bounds.start : start, endsAt: end, continued };
+}
+
+// Étiquette affichée: le nom donné dans la variable, sinon le titre de l'agenda
+// chez Google (sauf s'il ressemble à une adresse courriel), sinon "Google".
+function googleLabel(name, apiTitle) {
+  if (name) return `Google ${name}`;
+  if (apiTitle && !apiTitle.includes('@')) return `Google ${apiTitle}`;
+  return 'Google';
 }
 
 async function fetchGoogleCalendarItems(bounds) {
   const items = [];
   const failures = [];
-  for (const calendarId of googleCalendarIds) {
+  for (const { name, id } of googleCalendars) {
     try {
-      const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?${new URLSearchParams({
+      const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(id)}/events?${new URLSearchParams({
         timeMin: bounds.start.toISOString(),
         timeMax: bounds.end.toISOString(),
         singleEvents: 'true',
@@ -1098,15 +1117,16 @@ async function fetchGoogleCalendarItems(bounds) {
         timeZone: currentTimezone(),
       })}`;
       const res = await googleGet(url);
-      if (!res.ok) throw new Error(`Google Agenda a répondu ${res.status} pour "${calendarId}": ${await res.text()}`);
+      if (!res.ok) throw new Error(`Google Agenda a répondu ${res.status} pour "${id}": ${await res.text()}`);
       const data = await res.json();
+      const label = googleLabel(name, data.summary);
       for (const ev of data.items || []) {
-        const item = googleEventToItem(ev, bounds);
+        const item = googleEventToItem(ev, bounds, label);
         if (item) items.push(item);
       }
     } catch (err) {
       console.error(`⚠️ Google Agenda illisible: ${err.message}`);
-      failures.push(googleCalendarIds.length > 1 ? `Agenda Google « ${calendarId} » indisponible` : 'Agenda Google indisponible');
+      failures.push(googleCalendars.length > 1 ? `Agenda Google « ${name || id} » indisponible` : 'Agenda Google indisponible');
     }
   }
   return { items, failures };
@@ -1130,14 +1150,14 @@ async function fetchCalendar(bounds) {
     calendar.notes.push('Calendrier Notion indisponible');
   }
 
-  if (googleCredentials && googleCalendarIds.length > 0) {
+  if (googleCredentials && googleCalendars.length > 0) {
     const google = await fetchGoogleCalendarItems(bounds);
     calendar.items.push(...google.items);
     calendar.notes.push(...google.failures);
   }
 
   calendar.items.sort(compareCalendarItems);
-  const count = (source) => calendar.items.filter((i) => i.source === source).length;
+  const count = (prefix) => calendar.items.filter((i) => i.source.startsWith(prefix)).length;
   console.log(`📅 Calendrier: ${count('Notion')} événement(s) Notion, ${count('Google')} Google`);
   return calendar;
 }
