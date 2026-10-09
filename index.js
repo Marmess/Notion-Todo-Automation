@@ -1418,7 +1418,7 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
     textParts.push(
       [
         '\nCALENDRIER',
-        ...calendarItems.map((i) => `${whenOf(i)} - ${i.title} (${i.source})`),
+        ...[...calendarItems.filter((i) => !i.allDay), ...calendarItems.filter((i) => i.allDay)].map((i) => `${whenOf(i)} - ${i.title} (${i.source})`),
         ...calendarNotes.map((n) => `⚠️ ${n}`),
       ].join('\n')
     );
@@ -1437,10 +1437,10 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
     const listHtml = (items, withTime) =>
       items.length ? `<ul style="line-height:1.4;margin-top:0;padding-left:20px;">${items.map((i) => itemHtml(i, withTime)).join('\n')}</ul>` : '';
     const lis = [
+      timedItems.length ? listHtml(timedItems, true) : '',
       allDayItems.length
-        ? `<p style="color:#888;font-size:12px;margin:8px 0 2px;text-transform:uppercase;">Toute la journée</p>${listHtml(allDayItems, false)}`
+        ? `<p style="color:#000;font-size:14px;font-weight:bold;margin:12px 0 2px;text-transform:uppercase;">Toute la journée</p>${listHtml(allDayItems, false)}`
         : '',
-      timedItems.length ? `${allDayItems.length ? '<p style="margin:8px 0 2px;"></p>' : ''}${listHtml(timedItems, true)}` : '',
     ].join('\n');
     const notesHtml = calendarNotes
       .map((n) => `<p style="color:#888;font-size:12px;margin:4px 0;">⚠️ ${escapeHtml(n)}</p>`)
