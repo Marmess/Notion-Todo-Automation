@@ -1430,7 +1430,7 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
       const linked = i.url
         ? `<a href="${escapeHtml(i.url)}" style="text-decoration:none;color:#111;">${label}</a>`
         : label;
-      return `${linked} <span style="color:#888;font-size:12px;">${escapeHtml(i.source)}</span>`;
+      return `${linked} <span style="color:#888;font-size:12px;">(${escapeHtml(i.source)})</span>`;
     };
     const allDayItems = calendarItems.filter((i) => i.allDay);
     const timedItems = calendarItems.filter((i) => !i.allDay);
