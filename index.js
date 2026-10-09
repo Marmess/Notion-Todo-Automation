@@ -1423,25 +1423,27 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
       ].join('\n')
     );
     const itemHtml = (i, withTime) => {
-      // Le titre est un lien; l'heure (en gras) est dans le même lien. La source est sur sa propre ligne.
+      // Le titre est un lien (l'heure en gras est dans le même lien). La source suit, en gris.
       const label = withTime
         ? `<b>${escapeHtml(whenOf(i))}</b> ${escapeHtml(i.title)}`
         : escapeHtml(i.title);
       const linked = i.url
         ? `<a href="${escapeHtml(i.url)}" style="text-decoration:none;color:#111;">${label}</a>`
         : label;
-      return `<li style="margin-bottom:6px;">${linked}<br><span style="color:#888;font-size:12px;">${escapeHtml(i.source)}</span></li>`;
+      return `${linked} <span style="color:#888;font-size:12px;">${escapeHtml(i.source)}</span>`;
     };
     const allDayItems = calendarItems.filter((i) => i.allDay);
     const timedItems = calendarItems.filter((i) => !i.allDay);
-    const listHtml = (items, withTime) =>
-      items.length ? `<ul style="line-height:1.4;margin-top:0;padding-left:20px;">${items.map((i) => itemHtml(i, withTime)).join('\n')}</ul>` : '';
-    const lis = [
-      timedItems.length ? listHtml(timedItems, true) : '',
-      allDayItems.length
-        ? `<p style="color:#000;font-size:14px;font-weight:bold;margin:12px 0 2px;">Toute la journée</p>${listHtml(allDayItems, false)}`
-        : '',
-    ].join('\n');
+    // Événements avec heure: sans puces. Événements de la journée: avec puces.
+    const timedHtml = timedItems
+      .map((i) => `<p style="line-height:1.4;margin:0 0 8px;">${itemHtml(i, true)}</p>`)
+      .join('\n');
+    const allDayHtml = allDayItems.length
+      ? `<p style="color:#000;font-size:14px;font-weight:bold;margin:12px 0 2px;">Toute la journée</p><ul style="line-height:1.6;margin-top:0;padding-left:20px;">${allDayItems
+          .map((i) => `<li>${itemHtml(i, false)}</li>`)
+          .join('\n')}</ul>`
+      : '';
+    const lis = [timedHtml, allDayHtml].filter(Boolean).join('\n');
     const notesHtml = calendarNotes
       .map((n) => `<p style="color:#888;font-size:12px;margin:4px 0;">⚠️ ${escapeHtml(n)}</p>`)
       .join('\n');
