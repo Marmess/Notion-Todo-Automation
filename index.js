@@ -1257,8 +1257,8 @@ function googleEventToItem(ev, bounds, label) {
 // Étiquette affichée: le nom donné dans la variable, sinon le titre de l'agenda
 // chez Google (sauf s'il ressemble à une adresse courriel), sinon "Google".
 function googleLabel(name, apiTitle) {
-  if (name) return `Google ${name}`;
-  if (apiTitle && !apiTitle.includes('@')) return `Google ${apiTitle}`;
+  if (name) return name;
+  if (apiTitle && !apiTitle.includes('@')) return apiTitle;
   return 'Google';
 }
 
@@ -1422,23 +1422,33 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
         ...calendarNotes.map((n) => `⚠️ ${n}`),
       ].join('\n')
     );
-    const lis = calendarItems
-      .map((i) => {
-        // L'heure ET le nom sont dans le même lien.
-        const label = `${escapeHtml(whenOf(i))} - ${escapeHtml(i.title)}`;
-        const linked = i.url
-          ? `<a href="${escapeHtml(i.url)}" style="text-decoration:none;color:#111;">${label}</a>`
-          : label;
-        return `<li>${linked} <span style="color:#888;font-size:12px;">(${escapeHtml(i.source)})</span></li>`;
-      })
-      .join('\n');
+    const itemHtml = (i, withTime) => {
+      // Le titre est un lien; l'heure (en gras) est dans le même lien. La source est sur sa propre ligne.
+      const label = withTime
+        ? `<b>${escapeHtml(whenOf(i))}</b> ${escapeHtml(i.title)}`
+        : escapeHtml(i.title);
+      const linked = i.url
+        ? `<a href="${escapeHtml(i.url)}" style="text-decoration:none;color:#111;">${label}</a>`
+        : label;
+      return `<li style="margin-bottom:6px;">${linked}<br><span style="color:#888;font-size:12px;">${escapeHtml(i.source)}</span></li>`;
+    };
+    const allDayItems = calendarItems.filter((i) => i.allDay);
+    const timedItems = calendarItems.filter((i) => !i.allDay);
+    const listHtml = (items, withTime) =>
+      items.length ? `<ul style="line-height:1.4;margin-top:0;padding-left:20px;">${items.map((i) => itemHtml(i, withTime)).join('\n')}</ul>` : '';
+    const lis = [
+      allDayItems.length
+        ? `<p style="color:#888;font-size:12px;margin:8px 0 2px;text-transform:uppercase;">Toute la journée</p>${listHtml(allDayItems, false)}`
+        : '',
+      timedItems.length ? `${allDayItems.length ? '<p style="margin:8px 0 2px;"></p>' : ''}${listHtml(timedItems, true)}` : '',
+    ].join('\n');
     const notesHtml = calendarNotes
       .map((n) => `<p style="color:#888;font-size:12px;margin:4px 0;">⚠️ ${escapeHtml(n)}</p>`)
       .join('\n');
     const heading = calendarHeadingUrl
       ? `<a href="${escapeHtml(calendarHeadingUrl)}" style="text-decoration:none;color:inherit;">CALENDRIER</a>`
       : 'CALENDRIER';
-    calendarHtml = `<h2 style="margin-top:0;">${heading}</h2>\n${lis ? `<ul style="line-height:1.8;margin-top:0;">${lis}</ul>` : ''}\n${notesHtml}`;
+    calendarHtml = `<h2 style="margin-top:0;">${heading}</h2>\n${lis}\n${notesHtml}`;
   }
 
   // Deux colonnes (tâches à gauche, calendrier à droite) quand il y a un calendrier;
@@ -1446,8 +1456,8 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
   const body = calendarHtml
     ? `<table role="presentation" class="cols" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;">
           <tr>
-            <td class="col" width="50%" valign="top" style="width:50%;vertical-align:top;padding:0 12px 0 0;">${tasksHtml}</td>
-            <td class="col" width="50%" valign="top" style="width:50%;vertical-align:top;padding:0 0 0 12px;">${calendarHtml}</td>
+            <td class="col" width="55%" valign="top" style="width:55%;vertical-align:top;padding:0 16px 0 0;">${tasksHtml}</td>
+            <td class="col" width="45%" valign="top" style="width:45%;vertical-align:top;padding:0 0 0 16px;border-left:1px solid #ddd;">${calendarHtml}</td>
           </tr>
         </table>`
     : tasksHtml;
@@ -1456,8 +1466,8 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
     subject: `Tâches à faire — ${dateStr}`,
     text: textParts.join('\n\n'),
     html: `
-      <style>@media only screen and (max-width:600px){.col{display:block!important;width:100%!important;padding:0!important;}}</style>
-      <div style="font-family:sans-serif;max-width:900px;margin:0 auto;">
+      <style>@media only screen and (max-width:600px){.col{display:block!important;width:100%!important;padding:0!important;border-left:none!important;}}</style>
+      <div style="font-family:sans-serif;max-width:720px;margin:0 auto;">
         ${body}
       </div>
     `,
