@@ -1399,13 +1399,14 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
   };
 
   const textParts = [];
-  const htmlParts = [];
+  let tasksHtml = '';
+  let calendarHtml = '';
   if (tasks.length === 0) {
     textParts.push('Aucune tâche à faire pour le moment.');
-    htmlParts.push('<p>Aucune tâche à faire pour le moment.</p>');
+    tasksHtml = '<p>Aucune tâche à faire pour le moment.</p>';
   } else {
     textParts.push(`Tâches à faire:\n\n${sections.map((s) => textSection(s.label, s.tasks)).filter(Boolean).join('\n\n')}`);
-    htmlParts.push(`<h2>TÂCHES À FAIRE</h2>\n${sections.map((s) => htmlSection(s.label, s.tasks)).filter(Boolean).join('\n')}`);
+    tasksHtml = (`<h2 style="margin-top:0;">TÂCHES À FAIRE</h2>\n${sections.map((s) => htmlSection(s.label, s.tasks)).filter(Boolean).join('\n')}`);
   }
 
   // --- Calendrier du jour ---
@@ -1437,15 +1438,27 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
     const heading = calendarHeadingUrl
       ? `<a href="${escapeHtml(calendarHeadingUrl)}" style="text-decoration:none;color:inherit;">CALENDRIER</a>`
       : 'CALENDRIER';
-    htmlParts.push(`<br>\n<h2>${heading}</h2>\n${lis ? `<ul style="line-height:1.8;margin-top:0;">${lis}</ul>` : ''}\n${notesHtml}`);
+    calendarHtml = `<h2 style="margin-top:0;">${heading}</h2>\n${lis ? `<ul style="line-height:1.8;margin-top:0;">${lis}</ul>` : ''}\n${notesHtml}`;
   }
+
+  // Deux colonnes (tâches à gauche, calendrier à droite) quand il y a un calendrier;
+  // sur écran étroit (iPhone), les colonnes s'empilent. Sans calendrier: une colonne.
+  const body = calendarHtml
+    ? `<table role="presentation" class="cols" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;">
+          <tr>
+            <td class="col" width="50%" valign="top" style="width:50%;vertical-align:top;padding:0 12px 0 0;">${tasksHtml}</td>
+            <td class="col" width="50%" valign="top" style="width:50%;vertical-align:top;padding:0 0 0 12px;">${calendarHtml}</td>
+          </tr>
+        </table>`
+    : tasksHtml;
 
   return {
     subject: `Tâches à faire — ${dateStr}`,
     text: textParts.join('\n\n'),
     html: `
-      <div style="font-family:sans-serif;max-width:600px;margin:0 auto;">
-        ${htmlParts.join('\n')}
+      <style>@media only screen and (max-width:600px){.col{display:block!important;width:100%!important;padding:0!important;}}</style>
+      <div style="font-family:sans-serif;max-width:900px;margin:0 auto;">
+        ${body}
       </div>
     `,
   };
