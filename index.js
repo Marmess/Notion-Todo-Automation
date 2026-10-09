@@ -1439,7 +1439,7 @@ function buildEmailContent(tasks, calendar = { items: [], notes: [] }) {
     const lis = [
       timedItems.length ? listHtml(timedItems, true) : '',
       allDayItems.length
-        ? `<p style="color:#000;font-size:14px;font-weight:bold;margin:12px 0 2px;text-transform:uppercase;">Toute la journée</p>${listHtml(allDayItems, false)}`
+        ? `<p style="color:#000;font-size:14px;font-weight:bold;margin:12px 0 2px;">Toute la journée</p>${listHtml(allDayItems, false)}`
         : '',
     ].join('\n');
     const notesHtml = calendarNotes
