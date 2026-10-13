@@ -79,6 +79,9 @@ const {
   // Section CALENDRIER du courriel: événements d'aujourd'hui de la base Notion
   // (colonne Dates avec une heure) et de Google Agenda.
   CALENDAR_ENABLED = 'true',
+  // Un événement dont le titre commence par ce caractère n'apparaît pas dans le
+  // CALENDRIER du courriel (vide = aucun filtre). Le titre reste inchangé dans le calendrier.
+  CALENDAR_HIDE_MARKER = '.',
   // Clé JSON d'un compte de service Google (contenu du fichier, ou ce contenu
   // encodé en base64) et agendas à lire, séparés par des virgules. Chaque
   // entrée est un identifiant d'agenda, avec un nom facultatif qui s'affiche
@@ -1001,7 +1004,7 @@ async function fetchNotionCalendarItems(bounds) {
       if (!date?.start || !/T\d{2}:\d{2}/.test(date.start)) continue;
       const start = parseNotionDateTime(date.start, date.time_zone || currentTimezone());
       if (!start || start < bounds.start || start >= bounds.end) continue;
-      items.push({ source: 'Notion', title: extractTitle(page), url: taskLink(page), allDay: false, start });
+      items.push({ source: 'Notion', title: extractTitle(page), url: taskLink(page), allDay: false, start, pageId: page.id });
       pageIds.add(page.id);
     }
     if (!data.has_more || !data.next_cursor) break;
@@ -1364,6 +1367,18 @@ async function fetchCalendar(bounds) {
     const google = await fetchGoogleCalendarItems(bounds);
     calendar.items.push(...google.items);
     calendar.notes.push(...google.failures);
+  }
+
+  // Filtre manuel: titre qui commence par le caractère choisi (ex. ".").
+  const marker = String(CALENDAR_HIDE_MARKER || '').trim();
+  if (marker) {
+    const hidden = calendar.items.filter((i) => String(i.title || '').trimStart().startsWith(marker));
+    if (hidden.length > 0) {
+      calendar.items = calendar.items.filter((i) => !hidden.includes(i));
+      // Une tâche Notion masquée du calendrier reste dans la liste des tâches.
+      hidden.forEach((i) => i.pageId && calendar.notionPageIds.delete(i.pageId));
+      console.log(`🙈 ${hidden.length} événement(s) masqué(s) par "${marker}"`);
+    }
   }
 
   calendar.items.sort(compareCalendarItems);
