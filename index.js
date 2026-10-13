@@ -1314,6 +1314,7 @@ async function fetchGoogleCalendarItems(bounds) {
       const data = await res.json();
       const label = googleLabel(name, data.summary);
       for (const ev of data.items || []) {
+        console.log(`🎨 Google « ${label} »: ${String(ev.summary || '').slice(0, 40)} — couleur=${ev.colorId || 'défaut du calendrier'}`);
         if (ev.colorId && hideColorIds.has(String(ev.colorId))) continue; // masqué par sa couleur
         const item = googleEventToItem(ev, bounds, label);
         if (item) items.push(item);
@@ -1534,7 +1535,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function fetchSentMessageId(resendEmailId) {
   if (!resendEmailId) return '';
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
     try {
       const res = await fetch(`https://api.resend.com/emails/${resendEmailId}`, {
         headers: { Authorization: `Bearer ${RESEND_API_KEY}` },
@@ -1547,7 +1548,7 @@ async function fetchSentMessageId(resendEmailId) {
     } catch {
       /* on réessaie */
     }
-    if (attempt < 3) await sleep(400 * attempt);
+    if (attempt < 5) await sleep(700 * attempt);
   }
   return '';
 }
