@@ -82,6 +82,11 @@ const {
   // Un événement dont le titre commence par ce caractère n'apparaît pas dans le
   // CALENDRIER du courriel (vide = aucun filtre). Le titre reste inchangé dans le calendrier.
   CALENDAR_HIDE_MARKER = '.',
+  // Événements Google dont la couleur (modifiée pour cet événement seulement) est
+  // dans cette liste: masqués du courriel. 11 = Tomate. Vide = aucun filtre.
+  // Numéros: 1 Lavande, 2 Sauge, 3 Raisin, 4 Flamant, 5 Banane, 6 Mandarine,
+  // 7 Paon, 8 Graphite, 9 Myrtille, 10 Basilic, 11 Tomate.
+  CALENDAR_HIDE_COLOR_IDS = '11',
   // Clé JSON d'un compte de service Google (contenu du fichier, ou ce contenu
   // encodé en base64) et agendas à lire, séparés par des virgules. Chaque
   // entrée est un identifiant d'agenda, avec un nom facultatif qui s'affiche
@@ -1291,6 +1296,7 @@ function googleLabel(name, apiTitle) {
 }
 
 async function fetchGoogleCalendarItems(bounds) {
+  const hideColorIds = new Set(String(CALENDAR_HIDE_COLOR_IDS || '').split(',').map((c) => c.trim()).filter(Boolean));
   const items = [];
   const failures = [];
   for (const { name, id } of googleCalendars) {
@@ -1308,6 +1314,7 @@ async function fetchGoogleCalendarItems(bounds) {
       const data = await res.json();
       const label = googleLabel(name, data.summary);
       for (const ev of data.items || []) {
+        if (ev.colorId && hideColorIds.has(String(ev.colorId))) continue; // masqué par sa couleur
         const item = googleEventToItem(ev, bounds, label);
         if (item) items.push(item);
       }
