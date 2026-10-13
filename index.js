@@ -1072,6 +1072,18 @@ async function getNotionDatabaseInfo(id) {
   const info = {
     title: (db.title || []).map((t) => t.plain_text).join('').trim(),
     dateProps: Object.entries(db.properties || {}).filter(([, p]) => p.type === 'date').map(([name]) => name),
+    // Colonnes "statut": noms des options du groupe "Complete" (terminé), ex. "Done".
+    doneStatus: Object.entries(db.properties || {})
+      .filter(([, p]) => p.type === 'status')
+      .map(([name, p]) => {
+        const completeGroup = (p.status?.groups || []).find((g) => /complete|termin|done|fait/i.test(g.name || ''));
+        const ids = new Set(completeGroup?.option_ids || []);
+        return { name, ids };
+      }),
+    // Cases à cocher dont le nom ressemble à "Terminé" / "Done".
+    doneCheckboxes: Object.entries(db.properties || {})
+      .filter(([name, p]) => p.type === 'checkbox' && /done|termin|fait|complet/i.test(name))
+      .map(([name]) => name),
   };
   notionDatabaseInfoCache.set(id, { at: Date.now(), info });
   return info;
@@ -1123,6 +1135,18 @@ function notionDateToItem(date, bounds, label, page) {
 }
 
 // Événements d'aujourd'hui d'une autre base Notion (avec heure, ou toute la journée).
+// Vrai si la page est marquée terminée (statut du groupe "Complete" ou case "Done" cochée).
+function isPageDone(page, info) {
+  for (const { name, ids } of info.doneStatus || []) {
+    const value = page.properties?.[name]?.status;
+    if (value?.id && ids.has(value.id)) return true;
+  }
+  for (const name of info.doneCheckboxes || []) {
+    if (page.properties?.[name]?.checkbox === true) return true;
+  }
+  return false;
+}
+
 async function fetchExtraNotionCalendarItems(calendar, bounds) {
   const info = await getNotionDatabaseInfo(calendar.id);
   const dateProperty = pickDateProperty(calendar, info);
@@ -1152,6 +1176,7 @@ async function fetchExtraNotionCalendarItems(calendar, bounds) {
     if (!res.ok) throw new Error(`Notion a répondu ${res.status} pour la base ${calendar.id.slice(0, 8)}…: ${await res.text()}`);
     const data = await res.json();
     for (const page of data.results || []) {
+      if (isPageDone(page, info)) continue; // élément terminé: pas dans le calendrier
       const item = notionDateToItem(findProperty(page.properties, dateProperty)?.date, bounds, label, page);
       if (item) items.push(item);
     }
